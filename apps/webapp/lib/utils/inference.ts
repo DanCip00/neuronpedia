@@ -1,6 +1,8 @@
 import type { paths } from '@/lib/api/inference';
 import type {
   ActivationAttentionResponse,
+  ActivationSourceInput,
+  ActivationSourceInsertion,
   ActivationTopkByTokenResponse,
   NPSteerMethod,
   NPVectorRead,
@@ -602,20 +604,29 @@ export const getActivationForFeature = async (
 export const runInferenceActivationSource = async (
   modelId: string,
   source: string,
-  prompts: string[],
+  input:
+    | string[]
+    | {
+        prompts?: string[];
+        promptTokenIds?: number[][];
+        inputs?: ActivationSourceInput[];
+        insertion?: ActivationSourceInsertion;
+      },
   user: AuthenticatedUser | null,
 ) => {
   const serverHost = await resolveHost(inferenceTarget(modelId, { sourceId: source, user }));
 
   const transformerLensModelId = await getTransformerLensModelIdIfExists(modelId);
 
-  return makeInferenceServerApiWithServerHost(serverHost).POST('/v1/activation/source', {
-    body: {
-      prompts,
-      model: transformerLensModelId,
-      source,
-    },
-  });
+  return unwrapInferenceResponse(
+    makeInferenceServerApiWithServerHost(serverHost).POST('/v1/activation/source', {
+      body: {
+        ...(Array.isArray(input) ? { prompts: input } : input),
+        model: transformerLensModelId,
+        source,
+      },
+    }),
+  );
 };
 
 export const runInferenceActivationAll = async (

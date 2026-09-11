@@ -724,20 +724,91 @@ export interface components {
       tokensIsSpecial: boolean[];
     };
     /**
+     * ActivationSourceChatInput
+     * @description One conversation rendered by the selected model's configured chat template.
+     */
+    ActivationSourceChatInput: {
+      /**
+       * Addgenerationprompt
+       * @default true
+       */
+      addGenerationPrompt: boolean;
+      /**
+       * Applychattemplate
+       * @default true
+       * @constant
+       */
+      applyChatTemplate: true;
+      /**
+       * Continuefinalmessage
+       * @default false
+       */
+      continueFinalMessage: boolean;
+      /** Messages */
+      messages: components['schemas']['ChatMessage'][];
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      type: 'chat';
+    };
+    /**
+     * ActivationSourceInsertion
+     * @description Explicit additions around a text or exact-token activation input.
+     */
+    ActivationSourceInsertion: {
+      /** @default never */
+      bos: components['schemas']['TokenInsertionMode'];
+      /** @default never */
+      eos: components['schemas']['TokenInsertionMode'];
+      /** Prefixtokenids */
+      prefixTokenIds?: number[];
+      /** Suffixtokenids */
+      suffixTokenIds?: number[];
+    };
+    /**
+     * ActivationSourceOrigin
+     * @description Where bytes represented by one chat-template token originated.
+     */
+    ActivationSourceOrigin: {
+      /** Contentbyteend */
+      contentByteEnd?: number | null;
+      /** Contentbytestart */
+      contentByteStart?: number | null;
+      /** Messageindex */
+      messageIndex?: number | null;
+      /** Messagerole */
+      messageRole?: string | null;
+      /**
+       * Type
+       * @enum {string}
+       */
+      type: 'chat_template' | 'message_content' | 'bos';
+    };
+    /**
      * ActivationSourceRequest
      * @description For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.
      */
     ActivationSourceRequest: {
+      /** Inputs */
+      inputs?:
+        | (
+            | components['schemas']['ActivationSourceTextInput']
+            | components['schemas']['ActivationSourceTokensInput']
+            | components['schemas']['ActivationSourceChatInput']
+          )[]
+        | null;
+      /** @description Uniform insertion policy for prompts or promptTokenIds. Use per-input policies with inputs. */
+      insertion?: components['schemas']['ActivationSourceInsertion'] | null;
       /**
        * Model
        * @description Name of the model to test activations on
        */
       model: string;
-      /**
-       * Prompts
-       * @description Input text prompt to get activations for
-       */
-      prompts: string[];
+      /** Prompttokenids */
+      promptTokenIds?: number[][] | null;
+      /** Prompts */
+      prompts?: string[] | null;
       /**
        * Source
        * @description The source (eg 5-gemmascope-res-16k)
@@ -764,11 +835,81 @@ export interface components {
       activeFeatures?: {
         [key: string]: number[][];
       } | null;
+      /** Inputtomodelpositions */
+      inputToModelPositions?: number[] | null;
+      /** Inputtokenids */
+      inputTokenIds?: number[] | null;
+      /**
+       * Inputtype
+       * @enum {string}
+       */
+      inputType: 'text' | 'tokens' | 'chat';
+      /** Modelinputtokenids */
+      modelInputTokenIds: number[];
+      /** Renderedtext */
+      renderedText?: string | null;
+      /** Tokenalignment */
+      tokenAlignment: components['schemas']['ActivationSourceTokenAlignment'][];
       /**
        * Tokens
        * @description The prompt, tokenized.
        */
       tokens: string[];
+    };
+    /**
+     * ActivationSourceTextInput
+     * @description One raw-text row in a discriminated activation batch.
+     */
+    ActivationSourceTextInput: {
+      insertion?: components['schemas']['ActivationSourceInsertion'];
+      /** Text */
+      text: string;
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      type: 'text';
+    };
+    /**
+     * ActivationSourceTokenAlignment
+     * @description One model token's exact position and provenance.
+     */
+    ActivationSourceTokenAlignment: {
+      /** Inputposition */
+      inputPosition?: number | null;
+      /** Modelposition */
+      modelPosition: number;
+      /** Origins */
+      origins?: components['schemas']['ActivationSourceOrigin'][] | null;
+      /** Renderedbyteend */
+      renderedByteEnd?: number | null;
+      /** Renderedbytestart */
+      renderedByteStart?: number | null;
+      /**
+       * Source
+       * @enum {string}
+       */
+      source: 'provided' | 'bos' | 'eos' | 'prefix' | 'suffix' | 'chat_template' | 'message';
+      /** Tokenbytes */
+      tokenBytes?: string | null;
+      /** Tokenid */
+      tokenId: number;
+      /** Tokentext */
+      tokenText: string;
+    };
+    /**
+     * ActivationSourceTokensInput
+     * @description One exact-token row in a discriminated activation batch.
+     */
+    ActivationSourceTokensInput: {
+      insertion?: components['schemas']['ActivationSourceInsertion'];
+      /** Tokenids */
+      tokenIds: number[];
+      /**
+       * @description discriminator enum property added by openapi-typescript
+       * @enum {string}
+       */
+      type: 'tokens';
     };
     /**
      * ActivationTopkByTokenBatchRequest
@@ -1727,6 +1868,12 @@ export interface components {
       turns?: components['schemas']['SteerReadoutTurn'][] | null;
       type?: components['schemas']['NPSteerType'] | null;
     };
+    /**
+     * TokenInsertionMode
+     * @description Whether a tokenizer-owned boundary token should be inserted.
+     * @enum {string}
+     */
+    TokenInsertionMode: 'never' | 'if_missing' | 'always';
     /**
      * TokenSpan
      * @description One rendered token and the message it belongs to.

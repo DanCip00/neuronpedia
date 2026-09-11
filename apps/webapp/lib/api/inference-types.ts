@@ -21,7 +21,13 @@ export type ActivationAllResponse = Schemas['ActivationAllResponse'];
 export type ActivationAllBatchResponse = Schemas['ActivationAllBatchResponse'];
 export type ActivationSingleResponse = Schemas['ActivationSingleResponse'];
 export type ActivationSingleBatchResponse = Schemas['ActivationSingleBatchResponse'];
+export type ActivationSourceRequest = Schemas['ActivationSourceRequest'];
 export type ActivationSourceResponse = Schemas['ActivationSourceResponse'];
+export type ActivationSourceInput =
+  | Schemas['ActivationSourceTextInput']
+  | Schemas['ActivationSourceTokensInput']
+  | Schemas['ActivationSourceChatInput'];
+export type ActivationSourceInsertion = Schemas['ActivationSourceInsertion'];
 export type ActivationTopkByTokenResponse = Schemas['ActivationTopkByTokenResponse'];
 export type ActivationTopkByTokenBatchResponse = Schemas['ActivationTopkByTokenBatchResponse'];
 export type ActivationAttentionResponse = Schemas['ActivationAttentionResponse'];

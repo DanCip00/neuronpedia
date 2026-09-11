@@ -6,10 +6,12 @@ SAEs entirely. Each has a batch variant whose response is just the singular one 
 ``results``.
 """
 
-from typing import Annotated
+from enum import StrEnum
+from typing import Annotated, Literal
 
-from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
+from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
 
+from neuronpedia_inference.schemas.chat_template import ChatMessage
 from neuronpedia_inference.schemas.common import BaseSchema
 
 # The three request fields every SAE-backed activation endpoint shares are spelled out per
@@ -270,14 +272,114 @@ class ActivationTopkByTokenBatchResponse(BaseSchema):
     results: list[ActivationTopkByTokenBatchResult]
 
 
+class TokenInsertionMode(StrEnum):
+    """Whether a tokenizer-owned boundary token should be inserted."""
+
+    NEVER = "never"
+    IF_MISSING = "if_missing"
+    ALWAYS = "always"
+
+
+class ActivationSourceInsertion(BaseSchema):
+    """Explicit additions around a text or exact-token activation input."""
+
+    bos: TokenInsertionMode = TokenInsertionMode.NEVER
+    eos: TokenInsertionMode = TokenInsertionMode.NEVER
+    prefix_token_ids: list[StrictInt] = Field(default_factory=list)
+    suffix_token_ids: list[StrictInt] = Field(default_factory=list)
+
+
+class ActivationSourceTextInput(BaseSchema):
+    """One raw-text row in a discriminated activation batch."""
+
+    type: Literal["text"]
+    text: StrictStr
+    insertion: ActivationSourceInsertion = Field(default_factory=ActivationSourceInsertion)
+
+
+class ActivationSourceTokensInput(BaseSchema):
+    """One exact-token row in a discriminated activation batch."""
+
+    type: Literal["tokens"]
+    token_ids: list[StrictInt] = Field(min_length=1)
+    insertion: ActivationSourceInsertion = Field(default_factory=ActivationSourceInsertion)
+
+
+class ActivationSourceChatInput(BaseSchema):
+    """One conversation rendered by the selected model's configured chat template."""
+
+    type: Literal["chat"]
+    messages: list[ChatMessage] = Field(min_length=1)
+    apply_chat_template: Literal[True] = True
+    add_generation_prompt: StrictBool = True
+    continue_final_message: StrictBool = False
+
+    @model_validator(mode="after")
+    def check_generation_mode(self) -> "ActivationSourceChatInput":
+        """The tokenizer APIs define these as mutually exclusive render modes."""
+        if self.add_generation_prompt and self.continue_final_message:
+            raise ValueError("addGenerationPrompt and continueFinalMessage cannot both be true")
+        return self
+
+
+ActivationSourceInput = Annotated[
+    ActivationSourceTextInput | ActivationSourceTokensInput | ActivationSourceChatInput,
+    Field(discriminator="type"),
+]
+
+
 class ActivationSourceRequest(BaseSchema):
     """
     For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.
     """
 
-    prompts: list[StrictStr] = Field(description="Input text prompt to get activations for")
+    prompts: list[StrictStr] | None = Field(default=None, min_length=1, max_length=4)
+    prompt_token_ids: list[list[StrictInt]] | None = Field(default=None, min_length=1, max_length=4)
+    inputs: list[ActivationSourceInput] | None = Field(default=None, min_length=1, max_length=4)
+    insertion: ActivationSourceInsertion | None = Field(
+        default=None,
+        description="Uniform insertion policy for prompts or promptTokenIds. Use per-input policies with inputs.",
+    )
     model: StrictStr = Field(description="Name of the model to test activations on")
     source: StrictStr = Field(description="The source (eg 5-gemmascope-res-16k)")
+
+    @model_validator(mode="after")
+    def check_input_mode(self) -> "ActivationSourceRequest":
+        """Require one unambiguous batch representation."""
+        supplied = [self.prompts is not None, self.prompt_token_ids is not None, self.inputs is not None]
+        if sum(supplied) != 1:
+            raise ValueError("exactly one of prompts, promptTokenIds, or inputs must be provided")
+        if self.inputs is not None and self.insertion is not None:
+            raise ValueError("top-level insertion cannot be used with inputs; set insertion on each text/token input")
+        if self.prompt_token_ids is not None:
+            for index, row in enumerate(self.prompt_token_ids):
+                if not row:
+                    raise ValueError(f"promptTokenIds[{index}] must contain at least one token ID")
+        return self
+
+
+class ActivationSourceOrigin(BaseSchema):
+    """Where bytes represented by one chat-template token originated."""
+
+    type: Literal["chat_template", "message_content", "bos"]
+    message_index: StrictInt | None = None
+    message_role: StrictStr | None = None
+    content_byte_start: StrictInt | None = None
+    content_byte_end: StrictInt | None = None
+
+
+class ActivationSourceTokenAlignment(BaseSchema):
+    """One model token's exact position and provenance."""
+
+    model_position: StrictInt
+    token_id: StrictInt
+    token_text: StrictStr
+    input_position: StrictInt | None = None
+    source: Literal["provided", "bos", "eos", "prefix", "suffix", "chat_template", "message"]
+    token_bytes: StrictStr | None = None
+    rendered_byte_start: StrictInt | None = None
+    rendered_byte_end: StrictInt | None = None
+    origins: list[ActivationSourceOrigin] | None = None
 
 
 class ActivationSourceResult(BaseSchema):
@@ -286,6 +388,12 @@ class ActivationSourceResult(BaseSchema):
     """
 
     tokens: list[StrictStr] = Field(description="The prompt, tokenized.")
+    input_type: Literal["text", "tokens", "chat"]
+    input_token_ids: list[StrictInt] | None = None
+    model_input_token_ids: list[StrictInt]
+    token_alignment: list[ActivationSourceTokenAlignment]
+    input_to_model_positions: list[StrictInt] | None = None
+    rendered_text: StrictStr | None = None
     active_features: dict[str, list[Annotated[list[StrictFloat], Field(min_length=2, max_length=2)]]] | None = Field(
         default=None,
         description="Dictionary mapping feature indices to arrays of [token_index, activation_value]",

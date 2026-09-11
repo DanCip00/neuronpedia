@@ -770,21 +770,225 @@
         "title": "ActivationSingleResponse",
         "type": "object"
       },
+      "ActivationSourceChatInput": {
+        "description": "One conversation rendered by the selected model's configured chat template.",
+        "properties": {
+          "addGenerationPrompt": {
+            "default": true,
+            "title": "Addgenerationprompt",
+            "type": "boolean"
+          },
+          "applyChatTemplate": {
+            "const": true,
+            "default": true,
+            "title": "Applychattemplate",
+            "type": "boolean"
+          },
+          "continueFinalMessage": {
+            "default": false,
+            "title": "Continuefinalmessage",
+            "type": "boolean"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            },
+            "minItems": 1,
+            "title": "Messages",
+            "type": "array"
+          },
+          "type": {
+            "const": "chat",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "messages"
+        ],
+        "title": "ActivationSourceChatInput",
+        "type": "object"
+      },
+      "ActivationSourceInsertion": {
+        "description": "Explicit additions around a text or exact-token activation input.",
+        "properties": {
+          "bos": {
+            "$ref": "#/components/schemas/TokenInsertionMode",
+            "default": "never"
+          },
+          "eos": {
+            "$ref": "#/components/schemas/TokenInsertionMode",
+            "default": "never"
+          },
+          "prefixTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Prefixtokenids",
+            "type": "array"
+          },
+          "suffixTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Suffixtokenids",
+            "type": "array"
+          }
+        },
+        "title": "ActivationSourceInsertion",
+        "type": "object"
+      },
+      "ActivationSourceOrigin": {
+        "description": "Where bytes represented by one chat-template token originated.",
+        "properties": {
+          "contentByteEnd": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentbyteend"
+          },
+          "contentByteStart": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentbytestart"
+          },
+          "messageIndex": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageindex"
+          },
+          "messageRole": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messagerole"
+          },
+          "type": {
+            "enum": [
+              "chat_template",
+              "message_content",
+              "bos"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "ActivationSourceOrigin",
+        "type": "object"
+      },
       "ActivationSourceRequest": {
         "description": "For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.",
         "properties": {
+          "inputs": {
+            "anyOf": [
+              {
+                "items": {
+                  "discriminator": {
+                    "mapping": {
+                      "chat": "#/components/schemas/ActivationSourceChatInput",
+                      "text": "#/components/schemas/ActivationSourceTextInput",
+                      "tokens": "#/components/schemas/ActivationSourceTokensInput"
+                    },
+                    "propertyName": "type"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ActivationSourceTextInput"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ActivationSourceTokensInput"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ActivationSourceChatInput"
+                    }
+                  ]
+                },
+                "maxItems": 4,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputs"
+          },
+          "insertion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActivationSourceInsertion"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Uniform insertion policy for prompts or promptTokenIds. Use per-input policies with inputs."
+          },
           "model": {
             "description": "Name of the model to test activations on",
             "title": "Model",
             "type": "string"
           },
+          "promptTokenIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "maxItems": 4,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompttokenids"
+          },
           "prompts": {
-            "description": "Input text prompt to get activations for",
-            "items": {
-              "type": "string"
-            },
-            "title": "Prompts",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 4,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompts"
           },
           "source": {
             "description": "The source (eg 5-gemmascope-res-16k)",
@@ -793,7 +997,6 @@
           }
         },
         "required": [
-          "prompts",
           "model",
           "source"
         ],
@@ -843,6 +1046,68 @@
             "description": "Dictionary mapping feature indices to arrays of [token_index, activation_value]",
             "title": "Activefeatures"
           },
+          "inputToModelPositions": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputtomodelpositions"
+          },
+          "inputTokenIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputtokenids"
+          },
+          "inputType": {
+            "enum": [
+              "text",
+              "tokens",
+              "chat"
+            ],
+            "title": "Inputtype",
+            "type": "string"
+          },
+          "modelInputTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Modelinputtokenids",
+            "type": "array"
+          },
+          "renderedText": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renderedtext"
+          },
+          "tokenAlignment": {
+            "items": {
+              "$ref": "#/components/schemas/ActivationSourceTokenAlignment"
+            },
+            "title": "Tokenalignment",
+            "type": "array"
+          },
           "tokens": {
             "description": "The prompt, tokenized.",
             "items": {
@@ -853,9 +1118,158 @@
           }
         },
         "required": [
-          "tokens"
+          "tokens",
+          "inputType",
+          "modelInputTokenIds",
+          "tokenAlignment"
         ],
         "title": "ActivationSourceResult",
+        "type": "object"
+      },
+      "ActivationSourceTextInput": {
+        "description": "One raw-text row in a discriminated activation batch.",
+        "properties": {
+          "insertion": {
+            "$ref": "#/components/schemas/ActivationSourceInsertion"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "title": "ActivationSourceTextInput",
+        "type": "object"
+      },
+      "ActivationSourceTokenAlignment": {
+        "description": "One model token's exact position and provenance.",
+        "properties": {
+          "inputPosition": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputposition"
+          },
+          "modelPosition": {
+            "title": "Modelposition",
+            "type": "integer"
+          },
+          "origins": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ActivationSourceOrigin"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Origins"
+          },
+          "renderedByteEnd": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renderedbyteend"
+          },
+          "renderedByteStart": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renderedbytestart"
+          },
+          "source": {
+            "enum": [
+              "provided",
+              "bos",
+              "eos",
+              "prefix",
+              "suffix",
+              "chat_template",
+              "message"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "tokenBytes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokenbytes"
+          },
+          "tokenId": {
+            "title": "Tokenid",
+            "type": "integer"
+          },
+          "tokenText": {
+            "title": "Tokentext",
+            "type": "string"
+          }
+        },
+        "required": [
+          "modelPosition",
+          "tokenId",
+          "tokenText",
+          "source"
+        ],
+        "title": "ActivationSourceTokenAlignment",
+        "type": "object"
+      },
+      "ActivationSourceTokensInput": {
+        "description": "One exact-token row in a discriminated activation batch.",
+        "properties": {
+          "insertion": {
+            "$ref": "#/components/schemas/ActivationSourceInsertion"
+          },
+          "tokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 1,
+            "title": "Tokenids",
+            "type": "array"
+          },
+          "type": {
+            "const": "tokens",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "tokenIds"
+        ],
+        "title": "ActivationSourceTokensInput",
         "type": "object"
       },
       "ActivationTopkByTokenBatchRequest": {
@@ -2606,6 +3020,16 @@
         ],
         "title": "SteerVectorReadout",
         "type": "object"
+      },
+      "TokenInsertionMode": {
+        "description": "Whether a tokenizer-owned boundary token should be inserted.",
+        "enum": [
+          "never",
+          "if_missing",
+          "always"
+        ],
+        "title": "TokenInsertionMode",
+        "type": "string"
       },
       "TokenSpan": {
         "description": "One rendered token and the message it belongs to.",

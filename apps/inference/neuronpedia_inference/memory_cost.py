@@ -321,8 +321,30 @@ def activation_source_cost(request) -> int:  # type: ignore[no-untyped-def]
     source = getattr(request, "source", None)
     sources = [source] if source else []
     prompts = list(getattr(request, "prompts", None) or [])
-    batch = max(1, len(prompts))
-    n_tokens = max((estimate_tokens(p) for p in prompts), default=1)
+    token_rows = list(getattr(request, "prompt_token_ids", None) or [])
+    inputs = list(getattr(request, "inputs", None) or [])
+    estimates = [estimate_tokens(prompt) for prompt in prompts]
+    estimates.extend(len(row) for row in token_rows)
+    for row in inputs:
+        if getattr(row, "type", None) == "tokens":
+            estimates.append(len(getattr(row, "token_ids", None) or []))
+        elif getattr(row, "type", None) == "text":
+            estimates.append(estimate_tokens(getattr(row, "text", "")))
+        else:
+            # Chat scaffolding varies by tokenizer. Content length plus a fixed allowance per
+            # turn is deliberately conservative; this estimator is advisory and never renders.
+            messages = list(getattr(row, "messages", None) or [])
+            estimates.append(sum(estimate_tokens(getattr(message, "content", "")) + 16 for message in messages))
+        insertion = getattr(row, "insertion", None)
+        if insertion is not None:
+            estimates[-1] += len(insertion.prefix_token_ids) + len(insertion.suffix_token_ids) + 2
+    insertion = getattr(request, "insertion", None)
+    if insertion is not None and estimates:
+        estimates = [
+            estimate + len(insertion.prefix_token_ids) + len(insertion.suffix_token_ids) + 2 for estimate in estimates
+        ]
+    batch = max(1, len(prompts) or len(token_rows) or len(inputs))
+    n_tokens = max(estimates, default=1)
     d_sae, _ = _widest_source_dims(sources)
     return int(_OVERHEAD_FACTOR * (_capture_bytes(sources, n_tokens, batch=batch) + _encode_bytes(d_sae, n_tokens)))
 

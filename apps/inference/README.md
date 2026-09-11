@@ -14,6 +14,7 @@
 - [Usage Examples](#usage-examples)
   - [Get Activations for a Single Feature and Prompt](#get-activations-for-a-single-feature-and-prompt)
   - [Get Activations From One or More Layers/Sources/SAEs for a Prompt](#get-activations-from-one-or-more-layerssourcessaes-for-a-prompt)
+  - [Extract a Source From Exact Token IDs](#extract-a-source-from-exact-token-ids)
   - [Get Raw Residual Stream Vectors for a Prompt](#get-raw-residual-stream-vectors-for-a-prompt)
   - [Get Cosine Similarities](#get-cosine-similarities)
   - [Steering Chat Example gemma-2-2b-it (Returns Dog)](#steering-chat-example-gemma-2-2b-it-returns-dog)
@@ -400,6 +401,70 @@ curl -X POST http://127.0.0.1:5002/v1/activation/all \
  "ignore_bos": true
 }'
 ```
+
+### Extract a Source From Exact Token IDs
+
+`POST /v1/activation/source` accepts exactly one of `prompts`, `promptTokenIds`, or an ordered
+`inputs` array. The legacy `prompts` form retains its automatic BOS behavior. Exact token rows
+default to no BOS, EOS, chat template, or other special-token insertion and are passed directly
+to the model. `activeFeatures` stores `[modelPosition, activation]` pairs, so its positions always
+index `modelInputTokenIds`.
+
+Text and token inputs may explicitly request an insertion policy:
+
+```json
+{
+  "bos": "never",
+  "eos": "never",
+  "prefixTokenIds": [],
+  "suffixTokenIds": []
+}
+```
+
+Each boundary mode is `never`, `if_missing`, or `always`. Insertions are ordered as BOS, prefix,
+provided content, suffix, EOS and are reported individually in `tokenAlignment`. Chat inputs live
+in the discriminated `inputs` form, use the model's configured template, and support
+`addGenerationPrompt` or `continueFinalMessage` (not both).
+
+This `gemma-3-4b-it` request evaluates positive and negative teacher-forced candidates together
+against `22-gemmascope-2-res-16k`. The common prefix `x` is
+`[818, 5279, 529, 7001, 563]`; `9079` is the single token `" Paris"` and `5860` is the single token
+`" London"`:
+
+```bash
+curl -X POST http://127.0.0.1:5002/v1/activation/source \
+  -H "Content-Type: application/json" \
+  -H "X-SECRET-KEY: $SECRET" \
+  -d '{
+    "model": "gemma-3-4b-it",
+    "source": "22-gemmascope-2-res-16k",
+    "promptTokenIds": [
+      [818, 5279, 529, 7001, 563, 9079],
+      [818, 5279, 529, 7001, 563, 5860]
+    ]
+  }'
+```
+
+The two results stay in request order. With no insertion, both contain identity mappings
+`inputToModelPositions: [0, 1, 2, 3, 4, 5]`; the candidate is therefore at zero-based position
+`len(x) == 5` and cannot be boundary-retokenized. Every result includes:
+
+```json
+{
+  "inputType": "tokens",
+  "inputTokenIds": [818, 5279, 529, 7001, 563, 9079],
+  "modelInputTokenIds": [818, 5279, 529, 7001, 563, 9079],
+  "tokens": ["The", " capital", " of", " France", " is", " Paris"],
+  "inputToModelPositions": [0, 1, 2, 3, 4, 5],
+  "tokenAlignment": [
+    {"modelPosition": 5, "tokenId": 9079, "tokenText": " Paris", "inputPosition": 5, "source": "provided"}
+  ],
+  "activeFeatures": {"123": [[5, 1.234]]}
+}
+```
+
+Chat results instead include `renderedText` plus per-token UTF-8 byte spans and origins; they omit
+`inputTokenIds` because structured messages have no canonical flat pre-template token sequence.
 
 ### Get Raw Residual Stream Vectors for a Prompt
 
