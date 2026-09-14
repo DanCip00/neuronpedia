@@ -317,7 +317,7 @@ def activation_topk_by_token_cost(request) -> int:  # type: ignore[no-untyped-de
 
 
 def activation_source_cost(request) -> int:  # type: ignore[no-untyped-def]
-    """`/activation/source`: padded capture for the batch, but ONE sequence encoded at a time."""
+    """`/activation/source`: padded capture for the batch, then encode full or selected SAE rows."""
     source = getattr(request, "source", None)
     sources = [source] if source else []
     prompts = list(getattr(request, "prompts", None) or [])
@@ -346,7 +346,15 @@ def activation_source_cost(request) -> int:  # type: ignore[no-untyped-def]
     batch = max(1, len(prompts) or len(token_rows) or len(inputs))
     n_tokens = max(estimates, default=1)
     d_sae, _ = _widest_source_dims(sources)
-    return int(_OVERHEAD_FACTOR * (_capture_bytes(sources, n_tokens, batch=batch) + _encode_bytes(d_sae, n_tokens)))
+    activation_positions = getattr(request, "activation_positions", None)
+    encode_tokens = (
+        max(1, sum(len(positions) for positions in activation_positions))
+        if activation_positions is not None
+        else n_tokens
+    )
+    return int(
+        _OVERHEAD_FACTOR * (_capture_bytes(sources, n_tokens, batch=batch) + _encode_bytes(d_sae, encode_tokens))
+    )
 
 
 def _model_width() -> int:

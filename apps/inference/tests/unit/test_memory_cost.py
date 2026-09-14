@@ -330,3 +330,45 @@ def test_sae_residency_expands_the_all_layers_default():
 def test_sae_residency_finds_the_source_in_every_request_shape(request_obj):
     """Missing a shape would admit a steer or util request with no residency reserved."""
     assert sae_residency_bytes(request_obj) == D_SAE_WIDE * D_IN * 4
+
+
+def test_activation_source_selective_encode_cost_scales_with_selected_positions():
+    one_selected = SimpleNamespace(
+        source=NARROW_SOURCES[0],
+        prompt_token_ids=[[1] * 100],
+        activation_positions=[[-1]],
+    )
+    four_selected = SimpleNamespace(
+        source=NARROW_SOURCES[0],
+        prompt_token_ids=[[1] * 100],
+        activation_positions=[[0, 1, 2, -1]],
+    )
+
+    assert activation_source_cost(four_selected) > activation_source_cost(one_selected)
+
+
+def test_activation_source_selective_capture_still_scales_with_full_context_and_batch():
+    short = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 10], activation_positions=[[-1]])
+    long = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 100], activation_positions=[[-1]])
+    two_long = SimpleNamespace(
+        source=NARROW_SOURCES[0],
+        prompt_token_ids=[[1] * 100, [2] * 100],
+        activation_positions=[[-1], [-1]],
+    )
+
+    assert activation_source_cost(long) > activation_source_cost(short)
+    assert activation_source_cost(two_long) > activation_source_cost(long)
+
+
+def test_activation_source_selecting_one_position_is_cheaper_than_legacy_all_positions():
+    selective = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 200], activation_positions=[[-1]])
+    legacy = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 200])
+
+    assert activation_source_cost(selective) < activation_source_cost(legacy)
+
+
+def test_activation_source_omitted_selection_preserves_existing_estimate():
+    without_attr = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 50])
+    none_selection = SimpleNamespace(source=NARROW_SOURCES[0], prompt_token_ids=[[1] * 50], activation_positions=None)
+
+    assert activation_source_cost(none_selection) == activation_source_cost(without_attr)

@@ -31,9 +31,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Maximum number of prompts that can be processed in a single batch
-MAX_BATCH_SIZE = 4
-
 
 @router.post("/activation/all-batch", responses={200: {"model": ActivationAllBatchResponse}})
 @with_request_lock(exclusive=False, cost=activation_all_batch_cost)
@@ -51,9 +48,10 @@ async def activation_all_batch(
             status_code=400,
         )
 
-    if len(prompts) > MAX_BATCH_SIZE:
+    batch_size_limit = config.activation_batch_size
+    if len(prompts) > batch_size_limit:
         return JSONResponse(
-            content={"error": f"Batch size {len(prompts)} exceeds maximum of {MAX_BATCH_SIZE}"},
+            content={"error": f"Batch size {len(prompts)} exceeds maximum of {batch_size_limit}"},
             status_code=400,
         )
 
@@ -176,7 +174,7 @@ class ActivationProcessor(SinglePromptActivationProcessor):
                 truncate=False,
             )[0]
 
-            batch_token_limit = config.activation_token_limit / MAX_BATCH_SIZE
+            batch_token_limit = config.activation_token_limit / config.activation_batch_size
             if len(tokens) > batch_token_limit:
                 raise ValueError(f"Text too long: {len(tokens)} tokens, max is {batch_token_limit} for batch requests")
 

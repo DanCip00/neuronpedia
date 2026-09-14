@@ -9,6 +9,7 @@ whose last entry is the most recently used and whose first is the next to be evi
 """
 
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -135,6 +136,55 @@ class TestLoadSaes:
             "google/gemma-2-2b",
             "gemma-2-2b-it",
             "google/gemma-2-2b-it",
+        }
+
+    def test_direct_saelens_release_loads_without_neuronpedia_mapping(self):
+        config = build_config(
+            model_id="Qwen/Qwen3.5-27B",
+            sae_sets=[],
+            saelens_releases=["qwen-scope-3.5-27b-w80k-l50"],
+            include_sae=[r"^layer31$"],
+            max_loaded_saes=MAX_LOADED_SAES,
+        )
+        loaded_sae = SimpleNamespace(
+            cfg=SimpleNamespace(
+                d_sae=81920,
+                d_in=5120,
+                metadata=SimpleNamespace(neuronpedia_id=None),
+            )
+        )
+
+        with (
+            patch("neuronpedia_inference.sae_manager.Config.get_instance", return_value=config),
+            patch("neuronpedia_inference.sae_manager.get_sae_lens_ids_from_neuronpedia_id") as mapping,
+            patch(
+                "neuronpedia_inference.sae_manager.SaeLensSAE.load",
+                return_value=(loaded_sae, "blocks.31.hook_resid_post"),
+            ) as load,
+        ):
+            manager = SAEManager(num_layers=0, device="cpu")
+            manager.load_saes()
+
+        mapping.assert_not_called()
+        load.assert_called_once_with(
+            release="qwen-scope-3.5-27b-w80k-l50",
+            sae_id="layer31",
+            device="cpu",
+            dtype="float32",
+        )
+        assert manager.sae_set_to_saes["qwen-scope-3.5-27b-w80k-l50"] == ["layer31"]
+        assert list(manager.loaded_saes) == ["layer31"]
+        assert manager.sae_data["layer31"] == {
+            "sae": loaded_sae,
+            "hook": "blocks.31.hook_resid_post",
+            "nbytes": 0,
+            "neuronpedia_id": None,
+            "release": "qwen-scope-3.5-27b-w80k-l50",
+            "type": "saelens-1",
+            "d_sae": 81920,
+            "d_in": 5120,
+            "dfa_enabled": False,
+            "transcoder": False,
         }
 
 

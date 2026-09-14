@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 5
 
-# Maximum number of prompts that can be processed in a single batch
-MAX_BATCH_SIZE = 4
-
 router = APIRouter()
 
 
@@ -64,9 +61,10 @@ async def activation_topk_by_token_batch(
             status_code=400,
         )
 
-    if len(prompts) > MAX_BATCH_SIZE:
+    batch_size_limit = config.activation_batch_size
+    if len(prompts) > batch_size_limit:
         return JSONResponse(
-            content={"error": f"Batch size {len(prompts)} exceeds maximum of {MAX_BATCH_SIZE}"},
+            content={"error": f"Batch size {len(prompts)} exceeds maximum of {batch_size_limit}"},
             status_code=400,
         )
 
@@ -92,7 +90,7 @@ async def activation_topk_by_token_batch(
             truncate=False,
         )[0]
 
-        batch_token_limit = config.activation_token_limit / MAX_BATCH_SIZE
+        batch_token_limit = config.activation_token_limit / config.activation_batch_size
         too_long = reject_if_over_token_limit(len(tokens), batch_token_limit, suffix=" for batch requests")
         if too_long is not None:
             return too_long

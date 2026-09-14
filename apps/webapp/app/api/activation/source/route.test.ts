@@ -33,6 +33,7 @@ describe('/api/activation/source', () => {
         inputToModelPositions: ids.map((_, index) => index),
         tokens: ids.map(String),
         activeFeatures: { '7': [[5, 1.25]] },
+        activationPositions: [5],
         tokenAlignment: ids.map((tokenId, modelPosition) => ({
           modelPosition,
           tokenId,
@@ -50,6 +51,7 @@ describe('/api/activation/source', () => {
           modelId: 'gemma-3-4b-it',
           source: '22-gemmascope-2-res-16k',
           prompt_token_ids: rows,
+          activation_positions: [[-1], [-1]],
           insertion: { bos: 'never', eos: 'never', prefix_token_ids: [], suffix_token_ids: [] },
         }),
       }) as never,
@@ -61,6 +63,7 @@ describe('/api/activation/source', () => {
       '22-gemmascope-2-res-16k',
       {
         promptTokenIds: rows,
+        activationPositions: [[-1], [-1]],
         insertion: { bos: 'never', eos: 'never', prefixTokenIds: [], suffixTokenIds: [] },
       },
       null,
@@ -69,6 +72,10 @@ describe('/api/activation/source', () => {
     expect(payload.results.map((result: { model_input_token_ids: number[] }) => result.model_input_token_ids)).toEqual(
       rows,
     );
+    expect(payload.results.map((result: { activation_positions: number[] }) => result.activation_positions)).toEqual([
+      [5],
+      [5],
+    ]);
     expect(payload.results[0].token_alignment[5]).toMatchObject({
       model_position: 5,
       token_id: 9079,

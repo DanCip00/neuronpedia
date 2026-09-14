@@ -611,6 +611,7 @@ export const runInferenceActivationSource = async (
         promptTokenIds?: number[][];
         inputs?: ActivationSourceInput[];
         insertion?: ActivationSourceInsertion;
+        activationPositions?: number[][];
       },
   user: AuthenticatedUser | null,
 ) => {

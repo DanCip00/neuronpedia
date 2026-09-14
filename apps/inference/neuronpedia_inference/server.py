@@ -416,13 +416,15 @@ def _resolve_generation_only(args: Any) -> bool:
             "which hooks the module tree in-process. Unset GENERATION_ONLY, or force vLLM with "
             "--force-vllm."
         )
-    if args.sae_sets:
+    if args.sae_sets or getattr(args, "saelens_releases", []):
         raise ValueError(
-            f"GENERATION_ONLY=true cannot be combined with SAE_SETS={args.sae_sets!r}: reading an SAE "
-            "means capturing an activation, and this mode exists to give up capture (CUDA graph "
-            "replay skips the Python forward the hooks are attached to). Start with SAE_SETS='[]' to "
-            "serve completions only, or unset GENERATION_ONLY and pass STATIC_POINTS=sae to declare "
-            "those SAE sites and read them at graph speed."
+            "GENERATION_ONLY=true cannot be combined with configured SAEs "
+            f"(SAE_SETS={args.sae_sets!r}, SAELENS_RELEASE={getattr(args, 'saelens_releases', [])!r}): "
+            "reading an SAE means capturing an activation, and this mode exists to give up capture "
+            "(CUDA graph replay skips the Python forward the hooks are attached to). Start with "
+            "SAE_SETS='[]' and SAELENS_RELEASE='[]' to serve completions only, or unset "
+            "GENERATION_ONLY and pass STATIC_POINTS=sae to declare those SAE sites and read them "
+            "at graph speed."
         )
     static = getattr(args, "static_points", None)
     if static not in (None, ""):
@@ -744,6 +746,7 @@ if args.sentry_dsn:
     # look like a new deploy environment in the issue filters.
     sentry_sdk.set_tag("model_id", args.model_id)
     sentry_sdk.set_tag("sae_sets", ",".join(args.sae_sets) or "no-saes")
+    sentry_sdk.set_tag("saelens_releases", ",".join(getattr(args, "saelens_releases", [])) or "none")
     sentry_sdk.set_tag("model_dtype", args.model_dtype)
     # Everything else this pod was started with, as a context rather than more tags: tags are a
     # searchable index, and a namespace this size would swamp the ones worth filtering on above.
@@ -861,7 +864,11 @@ async def initialize(
         args_sae_sets = []
         for sae_set in args.sae_sets:
             args_sae_sets.extend(sae_set.split())
+        args_saelens_releases = []
+        for release in getattr(args, "saelens_releases", []):
+            args_saelens_releases.extend(release.split())
         logger.info("SAE sets: %s", args_sae_sets)
+        logger.info("Direct SAELens releases: %s", args_saelens_releases)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -896,10 +903,10 @@ async def initialize(
                 "site is already reachable and there is nothing to declare. Omit STATIC_POINTS, or "
                 "force vLLM with --force-vllm."
             )
-        if static_mode in _SAE_RESOLVED_MODES and not args_sae_sets:
+        if static_mode in _SAE_RESOLVED_MODES and not (args_sae_sets or args_saelens_releases):
             raise ValueError(
-                f"STATIC_POINTS={static_mode} needs SAE_SETS so there are hook sites to declare. "
-                "Use STATIC_POINTS=auto for the residual set alone."
+                f"STATIC_POINTS={static_mode} needs SAE_SETS or SAELENS_RELEASE so there are hook sites "
+                "to declare. Use STATIC_POINTS=auto for the residual set alone."
             )
         extra_points = _parse_extra_static_points(getattr(args, "static_points_extra", None))
         if extra_points and static_mode not in _SAE_RESOLVED_MODES:
@@ -923,9 +930,11 @@ async def initialize(
             model_id=args.model_id,
             custom_hf_model_id=custom_hf_model_id,
             sae_sets=args_sae_sets,
+            saelens_releases=args_saelens_releases,
             model_dtype=args.model_dtype,
             sae_dtype=args.sae_dtype,
             token_limit=args.token_limit,
+            activation_batch_size=args.activation_batch_size,
             lens_token_limit=args.lens_token_limit,
             device=args.device,
             override_model_id=args.override_model_id,

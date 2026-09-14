@@ -63,6 +63,7 @@ class SAEManager:
         self.sae_set_to_saes = {}
         self.valid_sae_sets = []
         self.loaded_saes = OrderedDict()  # Keep track of loaded SAEs
+        self.sae_id_to_release: dict[str, str] = {}
         # self.load_saes()
 
     def load_saes(self):
@@ -78,11 +79,18 @@ class SAEManager:
             return
 
         all_sae_ids = []
+        self.sae_id_to_release = {}
         for sae_set in server_cfg:
             logger.info(f"Processing SAE set: {sae_set['set']}")
             self.valid_sae_sets.append(sae_set["set"])
-            all_sae_ids.extend(sae_set["saes"])
-            self.sae_set_to_saes[sae_set["set"]] = sae_set["saes"]
+            sae_ids = sae_set["saes"]
+            if isinstance(sae_ids, str):
+                sae_ids = [sae_ids]
+            all_sae_ids.extend(sae_ids)
+            self.sae_set_to_saes[sae_set["set"]] = sae_ids
+            release = sae_set.get("release")
+            if isinstance(release, str):
+                self.sae_id_to_release.update(dict.fromkeys(sae_ids, release))
 
         model_id = self.config.custom_hf_model_id or self.config.model_id
 
@@ -146,13 +154,17 @@ class SAEManager:
         start_time = time.time()
         logger.info(f"Loading SAE: {sae_id}")
 
-        directory_df = get_saelens_neuronpedia_directory_df()
-        saelens_model_id = resolve_saelens_model_id(model_id, directory_df)
-        sae_lens_release, sae_lens_id = get_sae_lens_ids_from_neuronpedia_id(
-            model_id=saelens_model_id,
-            neuronpedia_id=sae_id,
-            df_exploded=directory_df,
-        )
+        sae_lens_release = self.sae_id_to_release.get(sae_id)
+        if sae_lens_release is None:
+            directory_df = get_saelens_neuronpedia_directory_df()
+            saelens_model_id = resolve_saelens_model_id(model_id, directory_df)
+            sae_lens_release, sae_lens_id = get_sae_lens_ids_from_neuronpedia_id(
+                model_id=saelens_model_id,
+                neuronpedia_id=sae_id,
+                df_exploded=directory_df,
+            )
+        else:
+            sae_lens_id = sae_id
 
         # Under paging the SAE never gets a permanent home on the GPU: it is loaded and
         # transformed on the host, and sae_cache moves it across on demand.
@@ -164,6 +176,7 @@ class SAEManager:
         )
 
         nbytes = sae_cache.register(sae_id, loaded_sae) if self.paging_enabled else 0
+        neuronpedia_id = getattr(loaded_sae.cfg.metadata, "neuronpedia_id", None)
 
         self.sae_data[sae_id] = {
             # Owned by sae_cache when paging: reading this directly would hand out weights
@@ -172,7 +185,8 @@ class SAEManager:
             "hook": hook_name,
             # GPU bytes this source occupies while resident, for admission control.
             "nbytes": nbytes,
-            "neuronpedia_id": loaded_sae.cfg.metadata.neuronpedia_id,
+            "neuronpedia_id": neuronpedia_id,
+            "release": sae_lens_release,
             "type": SAE_TYPE.SAELENS,
             # Recorded so request cost estimation (memory_cost.py) can size an encode
             # without holding the SAE: `unload_sae` clears "sae" but leaves these, and
@@ -182,10 +196,10 @@ class SAEManager:
             "d_in": int(loaded_sae.cfg.d_in),
             # TODO: this should be in SAELens
             "dfa_enabled": (
-                loaded_sae.cfg.metadata.neuronpedia_id is not None
+                neuronpedia_id is not None
                 and (
-                    DFA_ENABLED_NP_ID_SEGMENT in loaded_sae.cfg.metadata.neuronpedia_id
-                    or DFA_ENABLED_NP_ID_SEGMENT_ALT in loaded_sae.cfg.metadata.neuronpedia_id
+                    DFA_ENABLED_NP_ID_SEGMENT in neuronpedia_id
+                    or DFA_ENABLED_NP_ID_SEGMENT_ALT in neuronpedia_id
                 )
             ),
             "transcoder": False,  # You might want to set this based on some condition

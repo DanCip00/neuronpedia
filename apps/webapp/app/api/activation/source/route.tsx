@@ -56,6 +56,7 @@ const activationSourceSchema = yup
     prompts: yup.array().of(yup.string().required()).min(1).max(4),
     prompt_token_ids: yup.array().of(yup.array().of(yup.number().integer().required()).min(1).required()).min(1).max(4),
     inputs: yup.array().of(inputSchema).min(1).max(4),
+    activation_positions: yup.array().of(yup.array().of(yup.number().integer().required()).min(1).required()),
     insertion: insertionSchema.default(undefined),
   })
   .test(
@@ -125,6 +126,7 @@ const toPublicResponse = (response: Record<string, unknown>) => ({
     model_input_token_ids: result.modelInputTokenIds,
     ...(result.inputToModelPositions === undefined ? {} : { input_to_model_positions: result.inputToModelPositions }),
     ...(result.renderedText === undefined ? {} : { rendered_text: result.renderedText }),
+    ...(result.activationPositions === undefined ? {} : { activation_positions: result.activationPositions }),
     token_alignment: ((result.tokenAlignment as Array<Record<string, unknown>>) || []).map((entry) => ({
       model_position: entry.modelPosition,
       token_id: entry.tokenId,
@@ -173,6 +175,10 @@ const toPublicResponse = (response: Record<string, unknown>) => ({
  *                 maxItems: 4
  *                 items: { type: array, minItems: 1, items: {type: integer} }
  *               inputs: { type: array, maxItems: 4, description: Discriminated text, tokens, or chat inputs. }
+ *               activation_positions:
+ *                 type: array
+ *                 description: Optional model-input positions to SAE-encode per batch row. Use -1 for the final model token.
+ *                 items: { type: array, minItems: 1, items: {type: integer} }
  *               insertion: { type: object, description: Explicit BOS/EOS and prefix/suffix token insertion. }
  *     responses:
  *       200: { description: Ordered sparse activations with exact token alignment }
@@ -192,17 +198,19 @@ export const POST = withOptionalUser(async (request: RequestOptionalUser) => {
   try {
     await assertUserCanAccessModelAndSourceSet(body.modelId, getSourceSetNameFromSource(body.source), request.user);
     const customText = body.customText as string | string[] | undefined;
+    const customPrompts = typeof customText === 'string' ? [customText] : customText;
     const input =
       customText !== undefined
-        ? typeof customText === 'string'
-          ? [customText]
-          : customText
+        ? body.activation_positions === undefined
+          ? customPrompts
+          : { prompts: customPrompts, activationPositions: body.activation_positions }
         : {
             ...(body.prompts === undefined ? {} : { prompts: body.prompts }),
             ...(body.prompt_token_ids === undefined ? {} : { promptTokenIds: body.prompt_token_ids }),
             ...(body.inputs === undefined
               ? {}
               : { inputs: body.inputs.map((item) => toInferenceInput(item as PublicInput)) }),
+            ...(body.activation_positions === undefined ? {} : { activationPositions: body.activation_positions }),
             ...(body.insertion === undefined ? {} : { insertion: toInferenceInsertion(body.insertion) }),
           };
     const activation = await runInferenceActivationSource(body.modelId, body.source, input, request.user);

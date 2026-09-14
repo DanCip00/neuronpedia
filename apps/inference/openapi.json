@@ -905,6 +905,28 @@
       "ActivationSourceRequest": {
         "description": "For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.",
         "properties": {
+          "activationPositions": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {},
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional model-input positions to SAE-encode per batch row. Use -1 for the final model token.",
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Activationpositions"
+          },
           "inputs": {
             "anyOf": [
               {
@@ -929,7 +951,6 @@
                     }
                   ]
                 },
-                "maxItems": 4,
                 "minItems": 1,
                 "type": "array"
               },
@@ -964,7 +985,6 @@
                   },
                   "type": "array"
                 },
-                "maxItems": 4,
                 "minItems": 1,
                 "type": "array"
               },
@@ -980,7 +1000,6 @@
                 "items": {
                   "type": "string"
                 },
-                "maxItems": 4,
                 "minItems": 1,
                 "type": "array"
               },
@@ -1023,6 +1042,21 @@
       "ActivationSourceResult": {
         "description": "One prompt's results, only including non-zero values and non-zero activations",
         "properties": {
+          "activationPositions": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Normalized model-input positions that were SAE-encoded for this result.",
+            "title": "Activationpositions"
+          },
           "activeFeatures": {
             "anyOf": [
               {

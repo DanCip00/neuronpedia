@@ -5,6 +5,34 @@ import os
 from neuronpedia_inference.config import get_saelens_neuronpedia_directory_df
 
 
+def _json_or_split_env(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.split()
+    if isinstance(parsed, str):
+        return parsed.split()
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return []
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} must be an integer >= 1.") from None
+    if value < 1:
+        raise ValueError(f"{name}={raw!r} must be an integer >= 1.")
+    return value
+
+
 def parse_env_and_args():
     args = argparse.Namespace()
 
@@ -17,12 +45,14 @@ def parse_env_and_args():
     args.custom_hf_model_id = os.getenv("CUSTOM_HF_MODEL_ID", None)
     # An empty list is valid and means "load no SAEs": the model-only endpoints
     # (activation/raw, lens, steer, tokenize) work without them.
-    args.sae_sets = json.loads(os.getenv("SAE_SETS", '["res-jb"]'))
+    args.sae_sets = _json_or_split_env("SAE_SETS", ["res-jb"])
+    args.saelens_releases = _json_or_split_env("SAELENS_RELEASE", [])
     # "auto" loads each checkpoint in its native dtype (e.g. gemma-2/3, qwen3 = bf16; gpt2 = fp32)
     # rather than forcing fp32. Override with MODEL_DTYPE=float32 for tight fp32 numerics if needed.
     args.model_dtype = os.getenv("MODEL_DTYPE", "auto")
     args.sae_dtype = os.getenv("SAE_DTYPE", "float32")
     args.token_limit = int(os.getenv("TOKEN_LIMIT", "200"))
+    args.activation_batch_size = _positive_int_env("ACTIVATION_BATCH_SIZE", 4)
     # Separate cap for the lens endpoints only (logit/jacobian lens). Defaults to
     # 1024 and is independent of TOKEN_LIMIT so JLens conversations can be longer
     # (or shorter) than the limit used by the other endpoints.

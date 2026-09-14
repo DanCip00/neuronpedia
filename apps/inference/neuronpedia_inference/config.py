@@ -97,11 +97,13 @@ class Config:
     model_id: str = "openai-community/gpt2"
     custom_hf_model_id: str | None = None
     sae_sets: list[str] = field(default_factory=lambda: ["res-jb"])
+    saelens_releases: list[str] = field(default_factory=list)
     model_dtype: str = "auto"
     sae_dtype: str = "float32"
     secret: str | None = None
     port: int = 5000
     token_limit: int = 100
+    activation_batch_size: int = 4
     # Separate, higher cap that applies ONLY to the lens endpoints (logit/jacobian
     # lens). Independent of `token_limit` (which governs the completion/steer/tokenize
     # endpoints) so JLens can allow longer conversations without changing the other
@@ -163,10 +165,12 @@ class Config:
         "sae_dtype",
         "port",
         "token_limit",
+        "activation_batch_size",
         "lens_token_limit",
         "activation_token_limit",
         "device",
         "sae_sets",
+        "saelens_releases",
         "max_loaded_saes",
         "sae_gpu_budget_gib",
         "include_sae_patterns",
@@ -183,6 +187,8 @@ class Config:
         model_from_pretrained_kwargs: str,
     ) -> None:
         self.override_model_id = self.override_model_id or self.model_id
+        if self.activation_batch_size < 1:
+            raise ValueError("activation_batch_size must be >= 1")
         self.include_sae_patterns = include_sae
         self.exclude_sae_patterns = exclude_sae
         self.model_kwargs = json.loads(model_from_pretrained_kwargs)
@@ -261,23 +267,35 @@ class Config:
             )
 
     def _generate_sae_config(self):
-        # No sets requested means no SAEs at all, which is a supported way to run: the
+        # No sets/releases requested means no SAEs at all, which is a supported way to run: the
         # capture/lens/steer endpoints need only the model. Returning early also skips
         # downloading and parsing the SAELens directory, so such a pod has no dependency
         # on it during startup.
-        if not self.sae_sets:
-            logger.info("No SAE sets configured; starting without SAEs")
+        if not self.sae_sets and not self.saelens_releases:
+            logger.info("No SAE sets or direct SAELens releases configured; starting without SAEs")
             return []
         directory_df = get_saelens_neuronpedia_directory_df()
         configured = self.custom_hf_model_id if self.custom_hf_model_id else self.model_id
         selected_model = resolve_saelens_model_id(configured, directory_df)
         if selected_model != configured:
             logger.info("Resolved SAELens model id %r -> %r", configured, selected_model)
-        config_json = config_to_json(
-            directory_df,
-            selected_sets_neuronpedia=self.sae_sets,
-            selected_model=selected_model,
-        )
+        config_json = []
+        if self.sae_sets:
+            config_json.extend(
+                config_to_json(
+                    directory_df,
+                    selected_sets_neuronpedia=self.sae_sets,
+                    selected_model=selected_model,
+                )
+            )
+        if self.saelens_releases:
+            config_json.extend(
+                saelens_release_config_to_json(
+                    directory_df,
+                    selected_releases=self.saelens_releases,
+                    selected_model=selected_model,
+                )
+            )
         return config_json  # noqa: RET504
 
     def _filter_sae_config(self, sae_config: list[dict[str, str | list[str]]]) -> list[dict[str, str | list[str]]]:
@@ -372,6 +390,32 @@ def config_to_json(
                 "saes": [sae.split("/")[-1] for sae in set_data["neuronpedia_id"].tolist()],
             }
             config_json.append(set_entry)
+    return config_json
+
+
+def saelens_release_config_to_json(
+    directory_df: pd.DataFrame,
+    selected_releases: list[str],
+    selected_model: str | None = None,
+) -> list[dict[str, Any]]:
+    if selected_model:
+        directory_df = directory_df.loc[directory_df["model"] == selected_model]
+    directory_df = directory_df.loc[directory_df["release"].isin(selected_releases)]
+
+    config_json = []
+    for _, group in directory_df.groupby(["model", "release"], sort=False):
+        model = str(group["model"].iloc[0])
+        release = str(group["release"].iloc[0])
+        config_json.append(
+            {
+                "model": model,
+                "set": release,
+                "type": "saelens-1",
+                "local": False,
+                "release": release,
+                "saes": group["sae_lens_id"].tolist(),
+            }
+        )
     return config_json
 
 

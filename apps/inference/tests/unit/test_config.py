@@ -76,6 +76,18 @@ class TestConfigInitialization:
     def test_sae_config_passes_through_untouched_without_patterns(self, config: Config):
         assert config.sae_config == [sae_set("res-jb", RES_JB_SAES)]
 
+    def test_activation_batch_size_defaults_to_four(self, config: Config):
+        assert config.activation_batch_size == 4
+
+    def test_activation_batch_size_accepts_positive_integer(self):
+        config = build_config([sae_set("res-jb", RES_JB_SAES)], activation_batch_size=8)
+        assert config.activation_batch_size == 8
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_activation_batch_size_rejects_non_positive_values(self, value: int):
+        with pytest.raises(ValueError, match="activation_batch_size"):
+            build_config([sae_set("res-jb", RES_JB_SAES)], activation_batch_size=value)
+
 
 class TestSaeFiltering:
     @pytest.mark.parametrize(
@@ -174,3 +186,22 @@ class TestSaeLensDirectory:
 
         assert isinstance(json_output, list)
         assert {entry["set"] for entry in json_output} >= set(selected_sets)
+
+    def test_config_loads_direct_saelens_release_without_neuronpedia_ids(self):
+        config = Config(
+            model_id="Qwen/Qwen3.5-27B",
+            sae_sets=[],
+            saelens_releases=["qwen-scope-3.5-27b-w80k-l50"],
+            include_sae=[r"^layer31$"],
+        )
+
+        assert config.sae_config == [
+            {
+                "model": "Qwen/Qwen3.5-27B",
+                "set": "qwen-scope-3.5-27b-w80k-l50",
+                "type": "saelens-1",
+                "local": False,
+                "release": "qwen-scope-3.5-27b-w80k-l50",
+                "saes": ["layer31"],
+            }
+        ]

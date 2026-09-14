@@ -7,7 +7,7 @@ SAEs entirely. Each has a batch variant whose response is just the singular one 
 """
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
 
@@ -333,9 +333,14 @@ class ActivationSourceRequest(BaseSchema):
     For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.
     """
 
-    prompts: list[StrictStr] | None = Field(default=None, min_length=1, max_length=4)
-    prompt_token_ids: list[list[StrictInt]] | None = Field(default=None, min_length=1, max_length=4)
-    inputs: list[ActivationSourceInput] | None = Field(default=None, min_length=1, max_length=4)
+    prompts: list[StrictStr] | None = Field(default=None, min_length=1)
+    prompt_token_ids: list[list[StrictInt]] | None = Field(default=None, min_length=1)
+    inputs: list[ActivationSourceInput] | None = Field(default=None, min_length=1)
+    activation_positions: list[list[Any]] | None = Field(
+        default=None,
+        description="Optional model-input positions to SAE-encode per batch row. Use -1 for the final model token.",
+        json_schema_extra={"items": {"type": "array", "items": {"type": "integer"}}},
+    )
     insertion: ActivationSourceInsertion | None = Field(
         default=None,
         description="Uniform insertion policy for prompts or promptTokenIds. Use per-input policies with inputs.",
@@ -394,6 +399,10 @@ class ActivationSourceResult(BaseSchema):
     token_alignment: list[ActivationSourceTokenAlignment]
     input_to_model_positions: list[StrictInt] | None = None
     rendered_text: StrictStr | None = None
+    activation_positions: list[StrictInt] | None = Field(
+        default=None,
+        description="Normalized model-input positions that were SAE-encoded for this result.",
+    )
     active_features: dict[str, list[Annotated[list[StrictFloat], Field(min_length=2, max_length=2)]]] | None = Field(
         default=None,
         description="Dictionary mapping feature indices to arrays of [token_index, activation_value]",

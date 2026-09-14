@@ -39,6 +39,16 @@ def gpu_memory_fraction(value: str) -> float:
     return parsed
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {parsed}")
+    return parsed
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Initialize server configuration for Neuronpedia Inference Server.")
     parser.add_argument(
@@ -71,7 +81,13 @@ def parse_args():
         "--sae_sets",
         default=["res-jb"],
         nargs="+",
-        help="List of SAE sets to load. Can specify multiple.",
+        help="List of Neuronpedia SAE sets to load. Can specify multiple.",
+    )
+    parser.add_argument(
+        "--saelens_release",
+        default=[],
+        nargs="+",
+        help="List of SAELens releases to load directly by SAE ID, without Neuronpedia source mappings.",
     )
     parser.add_argument(
         "--no_saes",
@@ -95,6 +111,12 @@ def parse_args():
         type=int,
         default=200,
         help="Maximum number of tokens to process",
+    )
+    parser.add_argument(
+        "--activation_batch_size",
+        type=positive_int,
+        default=4,
+        help="Maximum number of prompts for SAE-backed activation batch endpoints.",
     )
     parser.add_argument(
         "--lens_token_limit",
@@ -269,12 +291,16 @@ def main():
         os.environ["OVERRIDE_MODEL_ID"] = args.override_model_id
     if "SAE_SETS" not in os.environ:
         os.environ["SAE_SETS"] = json.dumps([] if args.no_saes else args.sae_sets)
+    if "SAELENS_RELEASE" not in os.environ:
+        os.environ["SAELENS_RELEASE"] = json.dumps([] if args.no_saes else args.saelens_release)
     if "MODEL_DTYPE" not in os.environ:
         os.environ["MODEL_DTYPE"] = args.model_dtype
     if "SAE_DTYPE" not in os.environ:
         os.environ["SAE_DTYPE"] = args.sae_dtype
     if "TOKEN_LIMIT" not in os.environ:
         os.environ["TOKEN_LIMIT"] = str(args.token_limit)
+    if "ACTIVATION_BATCH_SIZE" not in os.environ:
+        os.environ["ACTIVATION_BATCH_SIZE"] = str(args.activation_batch_size)
     if "LENS_TOKEN_LIMIT" not in os.environ:
         os.environ["LENS_TOKEN_LIMIT"] = str(args.lens_token_limit)
     if "DEVICE" not in os.environ and args.device is not None:

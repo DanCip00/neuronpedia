@@ -26,7 +26,6 @@ from neuronpedia_inference.shared import Model, RecoverableOutOfMemory, recover_
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-MAX_BATCH_SIZE = 4
 ROUND_DECIMALS = 3
 
 
@@ -285,6 +284,50 @@ def _prepare_chat(model: Any, row: ActivationSourceChatInput, input_index: int, 
     return _PreparedInput("chat", None, model_ids, token_texts, alignment, None, rendered_text=rendered)
 
 
+def _resolve_activation_positions(
+    requested: list[list[int]] | None, prepared: list[_PreparedInput]
+) -> list[list[int]] | None:
+    """Normalize requested model-input positions after all input transformations."""
+    if requested is None:
+        return None
+    if len(requested) != len(prepared):
+        raise ValueError(f"activationPositions has {len(requested)} entries but request has {len(prepared)} input(s)")
+
+    resolved_by_input: list[list[int]] = []
+    for input_index, (positions, row) in enumerate(zip(requested, prepared, strict=True)):
+        if not positions:
+            raise ValueError(f"activationPositions[{input_index}] must contain at least one position")
+        seq_len = len(row.model_token_ids)
+        seen: set[int] = set()
+        resolved_positions: list[int] = []
+        for raw_position in positions:
+            if type(raw_position) is not int:
+                raise ValueError(
+                    f"activationPositions[{input_index}] contains malformed position {raw_position!r}; "
+                    "positions must be integers"
+                )
+            position = raw_position
+            if position < -1:
+                raise ValueError(
+                    f"activationPositions[{input_index}] contains invalid position {position}; "
+                    "only -1 or nonnegative positions are supported"
+                )
+            resolved = seq_len - 1 if position == -1 else position
+            if resolved < 0 or resolved >= seq_len:
+                raise ValueError(
+                    f"activationPositions[{input_index}] contains position {position} resolved to {resolved}, "
+                    f"outside model input length {seq_len}"
+                )
+            if resolved in seen:
+                raise ValueError(
+                    f"activationPositions[{input_index}] contains duplicate position {resolved} after normalization"
+                )
+            seen.add(resolved)
+            resolved_positions.append(resolved)
+        resolved_by_input.append(resolved_positions)
+    return resolved_by_input
+
+
 def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
     model = Model.get_instance()
     tokenizer = model.tokenizer
@@ -369,8 +412,12 @@ class ActivationProcessor:
         sae_manager = SAEManager.get_instance()
         config = Config.get_instance()
         batch_size = len(prepared)
+        if batch_size > config.activation_batch_size:
+            raise ValueError(f"Batch size {batch_size} exceeds maximum of {config.activation_batch_size}")
         batch_token_limit = (
-            config.activation_token_limit if batch_size == 1 else config.activation_token_limit / MAX_BATCH_SIZE
+            config.activation_token_limit
+            if batch_size == 1
+            else config.activation_token_limit / config.activation_batch_size
         )
         for index, row in enumerate(prepared):
             if len(row.model_token_ids) > batch_token_limit:
@@ -394,25 +441,66 @@ class ActivationProcessor:
             )
 
         hook_name = sae_manager.get_sae_hook(request.source)
+        selected_positions_by_input = _resolve_activation_positions(request.activation_positions, prepared)
         cache = await capture_padded_cache_async(model, padded_tokens, original_lengths, [hook_name])
         sae = sae_manager.get_sae(request.source)
         results: list[ActivationSourceResult] = []
-        for index, row in enumerate(prepared):
-            seq_len = original_lengths[index]
-            with torch.no_grad():
-                activation_data = cache[hook_name][index : index + 1, :seq_len].to(config.device)
-                prompt_activations = sae.encode(activation_data)[0].float().cpu().numpy()
-            token_indices, feature_indices = np.nonzero(prompt_activations)
-            activation_values = prompt_activations[token_indices, feature_indices]
-            active_features: dict[str, list[list[float]]] = {}
-            for token_idx, feature_idx, activation_value in zip(
-                token_indices, feature_indices, activation_values, strict=True
-            ):
-                if row.legacy_compat and token_idx == 0:
-                    continue
-                active_features.setdefault(str(int(feature_idx)), []).append(
-                    [int(token_idx), round(float(activation_value), ROUND_DECIMALS)]
+        if selected_positions_by_input is None:
+            for index, row in enumerate(prepared):
+                seq_len = original_lengths[index]
+                with torch.no_grad():
+                    activation_data = cache[hook_name][index : index + 1, :seq_len].to(config.device)
+                    prompt_activations = sae.encode(activation_data)[0].float().cpu().numpy()
+                token_indices, feature_indices = np.nonzero(prompt_activations)
+                activation_values = prompt_activations[token_indices, feature_indices]
+                active_features: dict[str, list[list[float]]] = {}
+                for token_idx, feature_idx, activation_value in zip(
+                    token_indices, feature_indices, activation_values, strict=True
+                ):
+                    if row.legacy_compat and token_idx == 0:
+                        continue
+                    active_features.setdefault(str(int(feature_idx)), []).append(
+                        [int(token_idx), round(float(activation_value), ROUND_DECIMALS)]
+                    )
+                results.append(
+                    ActivationSourceResult(
+                        tokens=row.tokens,
+                        input_type=row.input_type,
+                        input_token_ids=row.input_token_ids,
+                        model_input_token_ids=row.model_token_ids,
+                        token_alignment=row.alignment,
+                        input_to_model_positions=row.input_to_model_positions,
+                        rendered_text=row.rendered_text,
+                        activeFeatures=active_features,
+                    )
                 )
+            return results
+
+        selected_hidden_states: list[torch.Tensor] = []
+        selected_index: list[tuple[int, int]] = []
+        for input_index, positions in enumerate(selected_positions_by_input):
+            for position in positions:
+                selected_hidden_states.append(cache[hook_name][input_index, position])
+                selected_index.append((input_index, position))
+
+        active_features_by_input: list[dict[str, list[list[float]]]] = [{} for _ in prepared]
+        if selected_hidden_states:
+            with torch.no_grad():
+                selected_hidden = torch.stack(selected_hidden_states).to(config.device)
+                selected_activations = sae.encode(selected_hidden).float().cpu().numpy()
+            for encoded_index, (input_index, model_position) in enumerate(selected_index):
+                row_activations = selected_activations[encoded_index]
+                feature_indices = np.nonzero(row_activations)[0]
+                activation_values = row_activations[feature_indices]
+                active_features = active_features_by_input[input_index]
+                for feature_idx, activation_value in zip(feature_indices, activation_values, strict=True):
+                    active_features.setdefault(str(int(feature_idx)), []).append(
+                        [int(model_position), round(float(activation_value), ROUND_DECIMALS)]
+                    )
+
+        for row, positions, active_features in zip(
+            prepared, selected_positions_by_input, active_features_by_input, strict=True
+        ):
             results.append(
                 ActivationSourceResult(
                     tokens=row.tokens,
@@ -422,6 +510,7 @@ class ActivationProcessor:
                     token_alignment=row.alignment,
                     input_to_model_positions=row.input_to_model_positions,
                     rendered_text=row.rendered_text,
+                    activation_positions=positions,
                     activeFeatures=active_features,
                 )
             )

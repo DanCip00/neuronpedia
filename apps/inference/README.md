@@ -466,6 +466,35 @@ The two results stay in request order. With no insertion, both contain identity 
 Chat results instead include `renderedText` plus per-token UTF-8 byte spans and origins; they omit
 `inputTokenIds` because structured messages have no canonical flat pre-template token sequence.
 
+To encode only specific model-input positions through the SAE, pass `activationPositions`. Positions
+are resolved after BOS/EOS insertion, prefix/suffix insertion, and chat-template rendering. `-1`
+selects the final model-input token. Qwen still processes each complete contextual sequence; only
+the selected hidden states are passed through the SAE.
+
+```python
+payload = {
+    "model": "Qwen/Qwen3.5-27B",
+    "source": "layer31",
+    "promptTokenIds": [
+        positive_token_ids,
+        negative_token_ids,
+    ],
+    "activationPositions": [
+        [-1],
+        [-1],
+    ],
+    "insertion": {
+        "bos": "never",
+        "eos": "never",
+        "prefixTokenIds": [],
+        "suffixTokenIds": [],
+    },
+}
+```
+
+Each result includes the normalized model positions that were evaluated, for example
+`"activationPositions": [1023]`, even when that selected position has no active features.
+
 ### Get Raw Residual Stream Vectors for a Prompt
 
 `/v1/activation/raw` returns the residual stream (`resid_post`) at each prompt's **final
