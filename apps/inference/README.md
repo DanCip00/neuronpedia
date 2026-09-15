@@ -15,6 +15,7 @@
   - [Get Activations for a Single Feature and Prompt](#get-activations-for-a-single-feature-and-prompt)
   - [Get Activations From One or More Layers/Sources/SAEs for a Prompt](#get-activations-from-one-or-more-layerssourcessaes-for-a-prompt)
   - [Extract a Source From Exact Token IDs](#extract-a-source-from-exact-token-ids)
+  - [Generate With Request-Scoped SAE Feature Interventions](#generate-with-request-scoped-sae-feature-interventions)
   - [Get Raw Residual Stream Vectors for a Prompt](#get-raw-residual-stream-vectors-for-a-prompt)
   - [Get Cosine Similarities](#get-cosine-similarities)
   - [Steering Chat Example gemma-2-2b-it (Returns Dog)](#steering-chat-example-gemma-2-2b-it-returns-dog)
@@ -494,6 +495,53 @@ payload = {
 
 Each result includes the normalized model positions that were evaluated, for example
 `"activationPositions": [1023]`, even when that selected position has no active features.
+
+
+### Generate With Request-Scoped SAE Feature Interventions
+
+`POST /v1/steer/source` is an experimental, non-streaming vLLM route for causal tests on one exact-token input and one SAE source. It does not fine-tune weights, choose features, or imply that a feature is generally useful. Omit `steering`, or send an empty `features` list, for a baseline through the same generation path.
+
+The current serving contract accepts exactly one input and one SAE source per request and supports only single-GPU vLLM (`tensor_parallel_size=1`). Steered requests are rejected when static CUDA-graph writes or speculative decoding could bypass the schedule, or when the prompt would require unsafe chunked prefill; shorten the prompt or increase the server's configured batched-token capacity instead of relying on a partial edit. The route is non-streaming.
+
+The route edits decoder-direction contributions at the SAE's trained residual hook. Coefficients are in the loaded SAE's native decoder-coordinate units: `add` adds `value * W_dec[feature]` without encoding; `scale` changes the original TopK SAE activation by `(value - 1) * f_i`; `ablate` is `scale` with zero. Scale and ablation run the real SAE encoder on only the rows being edited, so inactive features stay inactive. SAE directions are not orthogonal and encoding is nonlinear, so re-encoding the edited hidden state is not guaranteed to recover the requested coordinate exactly.
+
+`positionPolicy: "next_token"` edits only the final prefill row that predicts the first generated token. `"each_generated_token"` edits that row and later decode rows that predict subsequent generated tokens; it never edits earlier prompt rows.
+
+```bash
+TOKENS=$(curl -s http://localhost:5000/v1/tokenize \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.5-27B","text":"def add(a, b):\n    "}' | jq -c '.tokens')
+
+curl -s http://localhost:5000/v1/steer/source \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Qwen/Qwen3.5-27B\",\"promptTokenIds\":[${TOKENS}],\"maxNewTokens\":32,\"temperature\":0.0,\"topLogprobs\":20}"
+```
+
+Fixed addition:
+
+```bash
+curl -s http://localhost:5000/v1/steer/source \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Qwen/Qwen3.5-27B\",\"promptTokenIds\":[${TOKENS}],\"steering\":{\"source\":\"layer31\",\"sourceSet\":\"qwen-scope-3.5-27b-w80k-l50\",\"positionPolicy\":\"next_token\",\"features\":[{\"featureIndex\":20713,\"operation\":\"add\",\"value\":1.0}]},\"maxNewTokens\":32,\"temperature\":0.0,\"topLogprobs\":20,\"returnInterventionDiagnostics\":true}"
+```
+
+Partial scaling:
+
+```bash
+curl -s http://localhost:5000/v1/steer/source \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Qwen/Qwen3.5-27B\",\"promptTokenIds\":[${TOKENS}],\"steering\":{\"source\":\"layer31\",\"sourceSet\":\"qwen-scope-3.5-27b-w80k-l50\",\"positionPolicy\":\"each_generated_token\",\"features\":[{\"featureIndex\":16134,\"operation\":\"scale\",\"value\":0.5}]},\"maxNewTokens\":32,\"temperature\":0.0,\"topLogprobs\":20,\"returnInterventionDiagnostics\":true}"
+```
+
+Ablation:
+
+```bash
+curl -s http://localhost:5000/v1/steer/source \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"Qwen/Qwen3.5-27B\",\"promptTokenIds\":[${TOKENS}],\"steering\":{\"source\":\"layer31\",\"sourceSet\":\"qwen-scope-3.5-27b-w80k-l50\",\"positionPolicy\":\"each_generated_token\",\"features\":[{\"featureIndex\":75577,\"operation\":\"ablate\"}]},\"maxNewTokens\":32,\"temperature\":0.0,\"topLogprobs\":20,\"returnInterventionDiagnostics\":true}"
+```
+
+The logprobs are natural-log probabilities reported by vLLM for the emitted token and its truncated top-K candidates; the top-K list is not renormalized into a full-vocabulary distribution.
 
 ### Get Raw Residual Stream Vectors for a Prompt
 

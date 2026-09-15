@@ -203,9 +203,7 @@ def test_insertion_alignment_is_explicit(monkeypatch: pytest.MonkeyPatch):
 
 def test_legacy_text_keeps_implicit_bos(monkeypatch: pytest.MonkeyPatch):
     _patch_runtime(monkeypatch)
-    request = ActivationSourceRequest(
-        model="gemma-3-4b-it", source="22-gemmascope-2-res-16k", prompts=["literal text"]
-    )
+    request = ActivationSourceRequest(model="gemma-3-4b-it", source="22-gemmascope-2-res-16k", prompts=["literal text"])
     row = source_endpoint._prepare_inputs(request)[0]
     assert row.input_token_ids == [10, 20]
     assert row.model_token_ids == [1, 10, 20]
@@ -436,7 +434,9 @@ def test_selective_chat_final_position_preserves_alignment(monkeypatch: pytest.M
     )
 
     result = asyncio.run(
-        source_endpoint.ActivationProcessor().process_activations_batch(request, source_endpoint._prepare_inputs(request))
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
     )[0]
 
     assert captured["tokens"] == [model_ids]
@@ -454,7 +454,9 @@ def test_legacy_all_position_response_omits_activation_positions(monkeypatch: py
         prompt_token_ids=[[10, 20]],
     )
     result = asyncio.run(
-        source_endpoint.ActivationProcessor().process_activations_batch(request, source_endpoint._prepare_inputs(request))
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
     )[0]
 
     assert result.activation_positions is None
@@ -470,7 +472,9 @@ def test_selective_positions_are_encoded_together_without_full_sequence(monkeypa
         activation_positions=[[-1], [-1]],
     )
     asyncio.run(
-        source_endpoint.ActivationProcessor().process_activations_batch(request, source_endpoint._prepare_inputs(request))
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
     )
 
     assert sae.encode_shapes == [(2, 3)]
@@ -484,7 +488,9 @@ def test_legacy_path_keeps_per_sequence_encode_shape(monkeypatch: pytest.MonkeyP
         prompt_token_ids=[[10, 20, 30], [10, 20]],
     )
     asyncio.run(
-        source_endpoint.ActivationProcessor().process_activations_batch(request, source_endpoint._prepare_inputs(request))
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
     )
 
     assert sae.encode_shapes == [(1, 3, 3), (1, 2, 3)]

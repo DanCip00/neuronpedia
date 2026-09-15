@@ -32,6 +32,7 @@ from neuronpedia_inference.memory_cost import (
     sae_residency_bytes,
     similarity_matrix_cost,
     steer_cost,
+    steer_source_cost,
 )
 
 SOURCE_SET = "res-test"
@@ -330,6 +331,36 @@ def test_sae_residency_expands_the_all_layers_default():
 def test_sae_residency_finds_the_source_in_every_request_shape(request_obj):
     """Missing a shape would admit a steer or util request with no residency reserved."""
     assert sae_residency_bytes(request_obj) == D_SAE_WIDE * D_IN * 4
+
+
+def test_sae_residency_finds_nested_source_steering() -> None:
+    request = SimpleNamespace(
+        steering=SimpleNamespace(
+            source=WIDE_SOURCE,
+            features=[SimpleNamespace(operation="add", value=1.0)],
+        )
+    )
+    assert sae_residency_bytes(request) == D_SAE_WIDE * D_IN * 4
+
+
+def test_noop_source_steering_does_not_reserve_sae_residency() -> None:
+    request = SimpleNamespace(
+        steering=SimpleNamespace(
+            source=WIDE_SOURCE,
+            features=[SimpleNamespace(operation="scale", value=1.0)],
+        )
+    )
+    assert sae_residency_bytes(request) == 0
+
+
+def test_scale_reserves_worker_sae_weights_while_add_does_not() -> None:
+    add = SimpleNamespace(
+        steering=SimpleNamespace(source=NARROW_SOURCES[0], features=[SimpleNamespace(operation="add", value=1.0)])
+    )
+    scale = SimpleNamespace(
+        steering=SimpleNamespace(source=NARROW_SOURCES[0], features=[SimpleNamespace(operation="scale", value=0.5)])
+    )
+    assert steer_source_cost(scale) > steer_source_cost(add)
 
 
 def test_activation_source_selective_encode_cost_scales_with_selected_positions():

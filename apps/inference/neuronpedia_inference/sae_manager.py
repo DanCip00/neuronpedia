@@ -187,6 +187,7 @@ class SAEManager:
             "nbytes": nbytes,
             "neuronpedia_id": neuronpedia_id,
             "release": sae_lens_release,
+            "saelens_id": sae_lens_id,
             "type": SAE_TYPE.SAELENS,
             # Recorded so request cost estimation (memory_cost.py) can size an encode
             # without holding the SAE: `unload_sae` clears "sae" but leaves these, and
@@ -197,10 +198,7 @@ class SAEManager:
             # TODO: this should be in SAELens
             "dfa_enabled": (
                 neuronpedia_id is not None
-                and (
-                    DFA_ENABLED_NP_ID_SEGMENT in neuronpedia_id
-                    or DFA_ENABLED_NP_ID_SEGMENT_ALT in neuronpedia_id
-                )
+                and (DFA_ENABLED_NP_ID_SEGMENT in neuronpedia_id or DFA_ENABLED_NP_ID_SEGMENT_ALT in neuronpedia_id)
             ),
             "transcoder": False,  # You might want to set this based on some condition
         }

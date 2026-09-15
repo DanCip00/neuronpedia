@@ -155,6 +155,38 @@ def lens_cost(
     return max(FLAT_LENS_BYTES, modelled)
 
 
+def steer_source_cost(request) -> int:  # type: ignore[no-untyped-def]
+    """`/steer/source`: generation plus one SAE source intervention.
+
+    Additive-only edits stage decoder rows in the worker. Scale/ablation encodes only the
+    prediction-producing rows, but under each-token steering that can happen once per decode
+    step. Reserve one flat steer budget plus enough room for the largest possible per-row SAE
+    encode for the selected source.
+    """
+    source = getattr(getattr(request, "steering", None), "source", None)
+    sources = [source] if source else []
+    d_sae, d_in = _widest_source_dims(sources)
+    features = list(getattr(getattr(request, "steering", None), "features", None) or [])
+    effective = [
+        feature
+        for feature in features
+        if not (
+            (str(getattr(feature, "operation", "")) == "add" and float(getattr(feature, "value", 0.0) or 0.0) == 0.0)
+            or (
+                str(getattr(feature, "operation", "")) == "scale"
+                and float(getattr(feature, "value", 1.0) or 0.0) == 1.0
+            )
+        )
+    ]
+    feature_count = len(effective)
+    decoder_rows = max(1, feature_count) * d_in * _sae_dtype_bytes()
+    needs_encoder = any(str(getattr(feature, "operation", "")) in {"scale", "ablate"} for feature in effective)
+    # Scale/ablation hold one request-scoped worker copy of the SAE; additive edits do not.
+    sae_weights = 2 * d_sae * d_in * _sae_dtype_bytes() if needs_encoder else 0
+    encode_row = _encode_bytes(d_sae, 1) if needs_encoder else 0
+    return int(FLAT_STEER_BYTES + _OVERHEAD_FACTOR * (sae_weights + encode_row + decoder_rows))
+
+
 def steer_cost(request) -> int:  # type: ignore[no-untyped-def] # noqa: ARG001
     """`/steer/completion*`: a flat reservation.
 
@@ -547,6 +579,21 @@ def request_sources(request) -> list[str]:  # type: ignore[no-untyped-def]
         value = getattr(feature, "source", None)
         if isinstance(value, str) and value:
             sources.append(value)
+    steering = getattr(request, "steering", None)
+    steering_source = getattr(steering, "source", None)
+    steering_features = list(getattr(steering, "features", None) or [])
+    has_effective_feature = any(
+        not (
+            (str(getattr(feature, "operation", "")) == "add" and float(getattr(feature, "value", 0.0) or 0.0) == 0.0)
+            or (
+                str(getattr(feature, "operation", "")) == "scale"
+                and float(getattr(feature, "value", 1.0) or 0.0) == 1.0
+            )
+        )
+        for feature in steering_features
+    )
+    if isinstance(steering_source, str) and steering_source and has_effective_feature:
+        sources.append(steering_source)
     return sources
 
 

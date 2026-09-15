@@ -171,8 +171,7 @@ def _chat_byte_offsets(tokenizer: Any, rendered: str, model_ids: list[int]) -> l
     if offset_ids == model_ids and offsets is not None and len(offsets) == len(model_ids):
         char_bytes = _char_to_byte_offsets(rendered)
         return [
-            (char_bytes[int(start)], char_bytes[int(end)]) if int(end) > int(start) else None
-            for start, end in offsets
+            (char_bytes[int(start)], char_bytes[int(end)]) if int(end) > int(start) else None for start, end in offsets
         ]
 
     # SentencePiece-backed tokenizers are often intentionally loaded as slow tokenizers and
@@ -381,7 +380,9 @@ def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
             raise ValueError(f"Unsupported activation input at position {index}")
         model_ids, alignment, input_positions = _apply_insertion(input_ids, row.insertion, tokenizer, valid_ids, index)
         prepared.append(
-            _PreparedInput(input_type, input_ids, model_ids, _decode_tokens(model, model_ids), alignment, input_positions)
+            _PreparedInput(
+                input_type, input_ids, model_ids, _decode_tokens(model, model_ids), alignment, input_positions
+            )
         )
     return prepared
 
@@ -431,9 +432,7 @@ class ActivationProcessor:
             pad_token_id = model.tokenizer.eos_token_id
         if pad_token_id is None:
             raise ValueError("Tokenizer has neither a padding token nor an EOS token")
-        padded_tokens = torch.full(
-            (batch_size, max_len), int(pad_token_id), dtype=torch.long, device=config.device
-        )
+        padded_tokens = torch.full((batch_size, max_len), int(pad_token_id), dtype=torch.long, device=config.device)
         original_lengths = [len(row.model_token_ids) for row in prepared]
         for index, row in enumerate(prepared):
             padded_tokens[index, : len(row.model_token_ids)] = torch.tensor(

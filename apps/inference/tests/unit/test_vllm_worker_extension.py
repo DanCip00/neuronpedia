@@ -24,6 +24,8 @@ import interp_engine
 import pytest
 from interp_engine import WORKER_EXTENSION_CLS, InterpWorkerExtension
 
+from neuronpedia_inference.vllm_sae_worker import NeuronpediaWorkerExtension
+
 # Mirrors vLLM's own check in WorkerBase.init_worker: every non-dunder attribute.
 _EXTENSION_ATTRS = sorted(name for name in dir(InterpWorkerExtension) if not name.startswith("__"))
 
@@ -142,10 +144,11 @@ def test_every_collective_rpc_name_exists_on_a_worker() -> None:
         if isinstance(arg, ast.Constant)
         and isinstance(arg.value, str)
         and not hasattr(InterpWorkerExtension, arg.value)
+        and not hasattr(NeuronpediaWorkerExtension, arg.value)
         and not hasattr(Worker, arg.value)
     ]
     assert not unknown, (
         f"collective_rpc names that are neither an InterpWorkerExtension method nor a vLLM "
         f"Worker attribute: {unknown}. Fix the name or add the method to "
-        "interp_engine.vllm_plugin."
+        "interp_engine.vllm_plugin or neuronpedia_inference.vllm_sae_worker."
     )

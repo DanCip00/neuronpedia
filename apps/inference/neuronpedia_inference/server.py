@@ -75,6 +75,9 @@ from neuronpedia_inference.endpoints.steer.completion import (
 from neuronpedia_inference.endpoints.steer.completion_chat import (
     router as steer_completion_chat_router,
 )
+from neuronpedia_inference.endpoints.steer.source import (
+    router as steer_source_router,
+)
 from neuronpedia_inference.endpoints.tokenize import router as tokenize_router
 from neuronpedia_inference.endpoints.util.sae_topk_by_decoder_cossim import (
     router as sae_topk_by_decoder_cossim_router,
@@ -360,6 +363,9 @@ def _vllm_backend_kwargs(
 ) -> dict[str, Any]:
     """Engine construction kwargs for the vLLM backend, beyond what ``load_model`` derives."""
     extra: dict[str, Any] = {
+        # Keep the engine's capture/steering extension surface, plus Neuronpedia's
+        # request-scoped SAE feature intervention methods used by /v1/steer/source.
+        "worker_extension_cls": "neuronpedia_inference.vllm_sae_worker.NeuronpediaWorkerExtension",
         # Tell vLLM this model is text-only, because on this server it is: no endpoint accepts
         # an image. The flag it reads, `is_mm_prefix_lm`, means "image tokens attend
         # bidirectionally", and vLLM keys it off `model_type` against a list that holds
@@ -791,6 +797,7 @@ v1_router.include_router(activation_all_router)
 v1_router.include_router(activation_all_batch_router)
 v1_router.include_router(steer_completion_chat_router)
 v1_router.include_router(steer_completion_router)
+v1_router.include_router(steer_source_router)
 v1_router.include_router(activation_single_router)
 v1_router.include_router(activation_single_batch_router)
 v1_router.include_router(activation_attention_router)

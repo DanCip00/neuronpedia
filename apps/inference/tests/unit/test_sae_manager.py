@@ -129,6 +129,8 @@ class TestLoadSaes:
 
         assert "1-gemmascope-mlp-16k" in manager.sae_data
         assert isinstance(manager.sae_data["1-gemmascope-mlp-16k"]["sae"], StubSAE)
+        assert manager.sae_data["1-gemmascope-mlp-16k"]["saelens_id"]
+        assert manager.sae_data["1-gemmascope-mlp-16k"]["saelens_id"] != "1-gemmascope-mlp-16k"
         # The SAELens id, the override, and the HF spelling of each (np_model_to_hf.json)
         # all have to be accepted, or requests naming the model the other way get a 400.
         assert manager.config.get_valid_model_ids() == {
@@ -180,6 +182,7 @@ class TestLoadSaes:
             "nbytes": 0,
             "neuronpedia_id": None,
             "release": "qwen-scope-3.5-27b-w80k-l50",
+            "saelens_id": "layer31",
             "type": "saelens-1",
             "d_sae": 81920,
             "d_in": 5120,

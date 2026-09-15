@@ -2458,6 +2458,25 @@
         "title": "NPVectorSource",
         "type": "object"
       },
+      "SAEInterventionOperation": {
+        "description": "How a selected SAE feature changes the hidden state.",
+        "enum": [
+          "add",
+          "scale",
+          "ablate"
+        ],
+        "title": "SAEInterventionOperation",
+        "type": "string"
+      },
+      "SAEInterventionPositionPolicy": {
+        "description": "Which generation prediction rows receive the intervention.",
+        "enum": [
+          "next_token",
+          "each_generated_token"
+        ],
+        "title": "SAEInterventionPositionPolicy",
+        "type": "string"
+      },
       "SimilarityMatrixRequest": {
         "description": "Predicted similarity matrix for one feature over a piece of text.",
         "properties": {
@@ -2513,6 +2532,419 @@
           "tokens"
         ],
         "title": "SimilarityMatrixResponse",
+        "type": "object"
+      },
+      "SourceSteerFeature": {
+        "description": "One explicitly selected SAE feature intervention.",
+        "properties": {
+          "featureIndex": {
+            "description": "Feature index in the loaded SAE",
+            "minimum": 0.0,
+            "title": "Featureindex",
+            "type": "integer"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/SAEInterventionOperation"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "featureIndex",
+          "operation"
+        ],
+        "title": "SourceSteerFeature",
+        "type": "object"
+      },
+      "SourceSteerInterventionDiagnostics": {
+        "description": "Small diagnostics for rows actually considered by the worker hook.",
+        "properties": {
+          "active": {
+            "default": false,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "editCount": {
+            "default": 0,
+            "title": "Editcount",
+            "type": "integer"
+          },
+          "editedPredictionSteps": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Editedpredictionsteps",
+            "type": "array"
+          },
+          "encoded": {
+            "default": false,
+            "title": "Encoded",
+            "type": "boolean"
+          },
+          "featureActivations": {
+            "additionalProperties": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Featureactivations",
+            "type": "object"
+          },
+          "perturbationNorms": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Perturbationnorms",
+            "type": "array"
+          }
+        },
+        "title": "SourceSteerInterventionDiagnostics",
+        "type": "object"
+      },
+      "SourceSteerRequest": {
+        "description": "Non-streaming exact-token generation with optional request-scoped SAE interventions.",
+        "properties": {
+          "failIfBusy": {
+            "default": false,
+            "title": "Failifbusy",
+            "type": "boolean"
+          },
+          "insertion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActivationSourceInsertion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxNewTokens": {
+            "default": 32,
+            "maximum": 512.0,
+            "minimum": 1.0,
+            "title": "Maxnewtokens",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "promptTokenIds": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "maxItems": 1,
+            "minItems": 1,
+            "title": "Prompttokenids",
+            "type": "array"
+          },
+          "returnInterventionDiagnostics": {
+            "default": false,
+            "title": "Returninterventiondiagnostics",
+            "type": "boolean"
+          },
+          "steering": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSteeringSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Temperature",
+            "type": "number"
+          },
+          "topLogprobs": {
+            "default": 0,
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Toplogprobs",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "promptTokenIds"
+        ],
+        "title": "SourceSteerRequest",
+        "type": "object"
+      },
+      "SourceSteerResolvedMetadata": {
+        "description": "Resolved source and worker-hook schedule served for one request.",
+        "properties": {
+          "backend": {
+            "const": "vllm",
+            "default": "vllm",
+            "title": "Backend",
+            "type": "string"
+          },
+          "hookLayer": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hooklayer"
+          },
+          "hookName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hookname"
+          },
+          "hookPoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hookpoint"
+          },
+          "positionPolicy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SAEInterventionPositionPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "prefillChunking": {
+            "const": "rejected_if_needed",
+            "default": "rejected_if_needed",
+            "title": "Prefillchunking",
+            "type": "string"
+          },
+          "saelensId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Saelensid"
+          },
+          "saelensRelease": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Saelensrelease"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "sourceSet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceset"
+          }
+        },
+        "title": "SourceSteerResolvedMetadata",
+        "type": "object"
+      },
+      "SourceSteerResponse": {
+        "description": "Result of one source-steered generation request.",
+        "properties": {
+          "finishReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finishreason"
+          },
+          "generatedText": {
+            "title": "Generatedtext",
+            "type": "string"
+          },
+          "generatedTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Generatedtokenids",
+            "type": "array"
+          },
+          "interventionDiagnostics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceSteerInterventionDiagnostics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "logprobs": {
+            "items": {
+              "$ref": "#/components/schemas/SourceSteerTokenLogprob"
+            },
+            "title": "Logprobs",
+            "type": "array"
+          },
+          "modelInputTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Modelinputtokenids",
+            "type": "array"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/SourceSteerResolvedMetadata"
+          }
+        },
+        "required": [
+          "modelInputTokenIds",
+          "generatedTokenIds",
+          "generatedText",
+          "resolved"
+        ],
+        "title": "SourceSteerResponse",
+        "type": "object"
+      },
+      "SourceSteerTokenLogprob": {
+        "description": "The emitted token and the backend-reported top candidates for that generated position.",
+        "properties": {
+          "logprob": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logprob"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "tokenId": {
+            "title": "Tokenid",
+            "type": "integer"
+          },
+          "topLogprobs": {
+            "items": {
+              "$ref": "#/components/schemas/SourceSteerTokenTopLogprob"
+            },
+            "title": "Toplogprobs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "tokenId",
+          "token"
+        ],
+        "title": "SourceSteerTokenLogprob",
+        "type": "object"
+      },
+      "SourceSteerTokenTopLogprob": {
+        "description": "One top-logprob candidate. These are truncated top-K logprobs, not renormalized.",
+        "properties": {
+          "logprob": {
+            "title": "Logprob",
+            "type": "number"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "tokenId": {
+            "title": "Tokenid",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tokenId",
+          "token",
+          "logprob"
+        ],
+        "title": "SourceSteerTokenTopLogprob",
+        "type": "object"
+      },
+      "SourceSteeringSpec": {
+        "description": "One SAE source whose selected decoder contributions are edited during generation.\n\nOperations add or remove decoder-direction contributions in the SAE's native units. SAE\ndecoder directions are not generally orthogonal and encoding is nonlinear, so re-encoding an\nedited hidden state need not recover the requested coordinate exactly; ablation removes that\ncoordinate's original decoder contribution, not a guarantee that a later encode is zero.",
+        "properties": {
+          "features": {
+            "items": {
+              "$ref": "#/components/schemas/SourceSteerFeature"
+            },
+            "title": "Features",
+            "type": "array"
+          },
+          "positionPolicy": {
+            "$ref": "#/components/schemas/SAEInterventionPositionPolicy"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "sourceSet": {
+            "title": "Sourceset",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "sourceSet",
+          "positionPolicy"
+        ],
+        "title": "SourceSteeringSpec",
         "type": "object"
       },
       "SteerCompletionChatRequest": {
@@ -4040,6 +4472,44 @@
           }
         },
         "summary": "Health Check"
+      }
+    },
+    "/v1/steer/source": {
+      "post": {
+        "operationId": "steerSourcePost",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceSteerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSteerResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Steer Source"
       }
     },
     "/v1/tokenize": {

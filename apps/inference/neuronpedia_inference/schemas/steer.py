@@ -6,10 +6,12 @@ a caller can diff them, which is why ``types`` is a list rather than a flag.
 """
 
 from enum import StrEnum
-from typing import Annotated
+from math import isfinite
+from typing import Annotated, Literal
 
-from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
+from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, field_validator, model_validator
 
+from neuronpedia_inference.schemas.activation import ActivationSourceInsertion
 from neuronpedia_inference.schemas.common import BaseSchema, ExactSchema, NPLogprob
 
 
@@ -293,6 +295,153 @@ class NPSteerCompletionOutput(BaseSchema):
         default=None,
         description='Per-token scores for the generated text, in output order. Absent unless logprobs were both requested and reported by the serving backend, so read its absence as "not available" rather than "no candidates".',
     )
+
+
+class SAEInterventionOperation(StrEnum):
+    """How a selected SAE feature changes the hidden state."""
+
+    ADD = "add"
+    SCALE = "scale"
+    ABLATE = "ablate"
+
+
+class SAEInterventionPositionPolicy(StrEnum):
+    """Which generation prediction rows receive the intervention."""
+
+    NEXT_TOKEN = "next_token"
+    EACH_GENERATED_TOKEN = "each_generated_token"
+
+
+class SourceSteerFeature(BaseSchema):
+    """One explicitly selected SAE feature intervention."""
+
+    feature_index: StrictInt = Field(ge=0, description="Feature index in the loaded SAE")
+    operation: SAEInterventionOperation
+    value: StrictFloat | None = Field(default=None, allow_inf_nan=False)
+
+    @field_validator("feature_index")
+    @classmethod
+    def no_bool_feature_index(cls, value: int) -> int:
+        if type(value) is not int:
+            raise ValueError("featureIndex must be an integer, not a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def check_operation_value(self) -> "SourceSteerFeature":
+        if self.operation == SAEInterventionOperation.ADD:
+            if self.value is None or not isfinite(float(self.value)):
+                raise ValueError("add requires a finite value")
+        elif self.operation == SAEInterventionOperation.SCALE:
+            if self.value is None or not isfinite(float(self.value)) or float(self.value) < 0:
+                raise ValueError("scale requires a finite nonnegative value")
+        elif self.operation == SAEInterventionOperation.ABLATE and self.value is not None:
+            raise ValueError("ablate does not take a value")
+        return self
+
+
+class SourceSteeringSpec(BaseSchema):
+    """One SAE source whose selected decoder contributions are edited during generation.
+
+    Operations add or remove decoder-direction contributions in the SAE's native units. SAE
+    decoder directions are not generally orthogonal and encoding is nonlinear, so re-encoding an
+    edited hidden state need not recover the requested coordinate exactly; ablation removes that
+    coordinate's original decoder contribution, not a guarantee that a later encode is zero.
+    """
+
+    source: StrictStr
+    source_set: StrictStr
+    position_policy: SAEInterventionPositionPolicy
+    features: list[SourceSteerFeature] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_duplicate_features(self) -> "SourceSteeringSpec":
+        seen: set[int] = set()
+        for feature in self.features:
+            if feature.feature_index in seen:
+                raise ValueError(f"duplicate featureIndex {feature.feature_index} in steering.features")
+            seen.add(feature.feature_index)
+        return self
+
+
+class SourceSteerTokenTopLogprob(BaseSchema):
+    """One top-logprob candidate. These are truncated top-K logprobs, not renormalized."""
+
+    token_id: StrictInt
+    token: StrictStr
+    logprob: StrictFloat
+
+
+class SourceSteerTokenLogprob(BaseSchema):
+    """The emitted token and the backend-reported top candidates for that generated position."""
+
+    token_id: StrictInt
+    token: StrictStr
+    logprob: StrictFloat | None = None
+    top_logprobs: list[SourceSteerTokenTopLogprob] = Field(default_factory=list)
+
+
+class SourceSteerResolvedMetadata(BaseSchema):
+    """Resolved source and worker-hook schedule served for one request."""
+
+    source: StrictStr | None = None
+    source_set: StrictStr | None = None
+    saelens_release: StrictStr | None = None
+    saelens_id: StrictStr | None = None
+    hook_name: StrictStr | None = None
+    hook_point: StrictStr | None = None
+    hook_layer: StrictInt | None = None
+    position_policy: SAEInterventionPositionPolicy | None = None
+    backend: Literal["vllm"] = "vllm"
+    prefill_chunking: Literal["rejected_if_needed"] = "rejected_if_needed"
+
+
+class SourceSteerInterventionDiagnostics(BaseSchema):
+    """Small diagnostics for rows actually considered by the worker hook."""
+
+    edited_prediction_steps: list[StrictInt] = Field(default_factory=list)
+    edit_count: StrictInt = 0
+    perturbation_norms: list[StrictFloat] = Field(default_factory=list)
+    feature_activations: dict[StrictStr, list[StrictFloat]] = Field(default_factory=dict)
+    encoded: StrictBool = False
+    active: StrictBool = False
+
+
+class SourceSteerRequest(BaseSchema):
+    """Non-streaming exact-token generation with optional request-scoped SAE interventions."""
+
+    model: StrictStr
+    prompt_token_ids: list[list[StrictInt]] = Field(min_length=1, max_length=1)
+    insertion: "ActivationSourceInsertion | None" = None
+    steering: SourceSteeringSpec | None = None
+    max_new_tokens: Annotated[int, Field(strict=True, ge=1, le=512)] = 32
+    temperature: Annotated[float, Field(strict=True, ge=0)] = 0.0
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] = 0
+    return_intervention_diagnostics: StrictBool = False
+    fail_if_busy: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    def check_one_input_and_ids(self) -> "SourceSteerRequest":
+        if len(self.prompt_token_ids) != 1:
+            raise ValueError("/v1/steer/source supports exactly one promptTokenIds row")
+        row = self.prompt_token_ids[0]
+        if not row:
+            raise ValueError("promptTokenIds[0] must contain at least one token ID")
+        for index, token_id in enumerate(row):
+            if type(token_id) is not int:
+                raise ValueError(f"promptTokenIds[0][{index}] must be an integer token ID")
+        return self
+
+
+class SourceSteerResponse(BaseSchema):
+    """Result of one source-steered generation request."""
+
+    model_input_token_ids: list[StrictInt]
+    generated_token_ids: list[StrictInt]
+    generated_text: StrictStr
+    finish_reason: StrictStr | None = None
+    logprobs: list[SourceSteerTokenLogprob] = Field(default_factory=list)
+    resolved: SourceSteerResolvedMetadata
+    intervention_diagnostics: SourceSteerInterventionDiagnostics | None = None
 
 
 class SteerCompletionRequest(BaseSchema):
