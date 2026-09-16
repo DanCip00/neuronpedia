@@ -176,6 +176,7 @@ def test_noop_uses_baseline_path_without_loading_or_registering(monkeypatch: pyt
     assert model.engine.calls == []
     assert manager.get_sae_calls == 0
     assert response["resolved"]["source"] == "layer0"
+    assert response["resolved"]["features"] == []
     assert response["interventionDiagnostics"]["active"] is False
 
 
@@ -196,10 +197,31 @@ def test_baseline_steered_baseline_has_no_cross_request_registration(monkeypatch
     assert baseline_one["generatedTokenIds"] == baseline_two["generatedTokenIds"] == [7]
     assert steered["interventionDiagnostics"]["editedPredictionSteps"] == [2]
     assert steered["interventionDiagnostics"]["editCount"] == 1
+    assert steered["resolved"]["features"] == [{"featureIndex": 1, "operation": "add", "value": 2.0}]
     register_spec = model.engine.calls[0][1][1][0]
     assert register_spec["sae"]["sae_id"] == "checkpoint0"
     assert register_spec["sae"]["dtype"] == "float32"
     assert register_spec["decoder_vectors"]["1"] == [0.0, 1.0, 0.0]
+
+
+def test_resolved_features_echo_every_effective_operation(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, manager = _VLLMModel(), _Manager()
+    _patch_runtime(monkeypatch, model, manager)
+    features = [
+        {"featureIndex": 0, "operation": "add", "value": 4.0},
+        {"featureIndex": 1, "operation": "scale", "value": 0.5},
+        {"featureIndex": 2, "operation": "ablate"},
+    ]
+
+    response = asyncio.run(_call(_request(features)))
+
+    assert response["resolved"]["features"] == features
+    register_spec = model.engine.calls[0][1][1][0]
+    assert register_spec["features"] == [
+        {"feature_index": 0, "operation": "add", "value": 4.0},
+        {"feature_index": 1, "operation": "scale", "value": 0.5},
+        {"feature_index": 2, "operation": "ablate", "value": None},
+    ]
 
 
 def test_cancelled_generation_unregisters_worker_state(monkeypatch: pytest.MonkeyPatch) -> None:

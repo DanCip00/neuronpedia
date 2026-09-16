@@ -228,6 +228,7 @@ def _resolve_source_metadata(request: SourceSteerRequest) -> tuple[dict[str, Any
     if d_sae is None:
         raise ValueError(f"source {steering.source!r} is not an SAE-backed source")
     validate_feature_interventions(_operation_payload(request), d_sae)
+    worker_features = _worker_feature_payload(request)
     hook_name = manager.get_sae_hook(steering.source)
     address = tlens_hook_to_point(hook_name)
     if address.name != "resid_post" or address.layer is None:
@@ -240,7 +241,7 @@ def _resolve_source_metadata(request: SourceSteerRequest) -> tuple[dict[str, Any
         "layer": int(address.layer),
         "point": str(address.name),
         "position_policy": steering.position_policy.value,
-        "features": _worker_feature_payload(request),
+        "features": worker_features,
         "return_diagnostics": bool(request.return_intervention_diagnostics),
         "sae": {
             "model": request.model,
@@ -261,8 +262,9 @@ def _resolve_source_metadata(request: SourceSteerRequest) -> tuple[dict[str, Any
         hook_point=address.name,
         hook_layer=int(address.layer),
         position_policy=steering.position_policy,
+        features=[SourceSteerFeature.model_validate(feature) for feature in worker_features],
     )
-    if not _worker_feature_payload(request):
+    if not worker_features:
         return None, resolved
     return payload, resolved
 

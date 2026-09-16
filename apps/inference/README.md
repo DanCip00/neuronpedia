@@ -542,6 +542,7 @@ curl -s http://localhost:5000/v1/steer/source \
 ```
 
 The logprobs are natural-log probabilities reported by vLLM for the emitted token and its truncated top-K candidates; the top-K list is not renormalized into a full-vocabulary distribution.
+The response's `resolved.features` contains the exact effective feature operations sent to the worker. Explicit no-ops such as `add: 0` and `scale: 1` are omitted because no intervention was applied; an ablation has no `value` field.
 
 ### Get Raw Residual Stream Vectors for a Prompt
 

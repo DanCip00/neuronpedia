@@ -391,6 +391,7 @@ class SourceSteerResolvedMetadata(BaseSchema):
     hook_point: StrictStr | None = None
     hook_layer: StrictInt | None = None
     position_policy: SAEInterventionPositionPolicy | None = None
+    features: list[SourceSteerFeature] = Field(default_factory=list)
     backend: Literal["vllm"] = "vllm"
     prefill_chunking: Literal["rejected_if_needed"] = "rejected_if_needed"
 
