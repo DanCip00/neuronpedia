@@ -23,6 +23,7 @@ import pytest
 
 from neuronpedia_inference import memory_cost
 from neuronpedia_inference.memory_cost import (
+    _widest_source_dims,
     activation_all_batch_cost,
     activation_all_cost,
     activation_single_cost,
@@ -353,14 +354,19 @@ def test_noop_source_steering_does_not_reserve_sae_residency() -> None:
     assert sae_residency_bytes(request) == 0
 
 
-def test_scale_reserves_worker_sae_weights_while_add_does_not() -> None:
+def test_scale_reserves_an_encode_row_but_not_the_resident_worker_sae() -> None:
+    """The worker keeps the encoder across requests, so only the per-row encode is a working set."""
     add = SimpleNamespace(
         steering=SimpleNamespace(source=NARROW_SOURCES[0], features=[SimpleNamespace(operation="add", value=1.0)])
     )
     scale = SimpleNamespace(
         steering=SimpleNamespace(source=NARROW_SOURCES[0], features=[SimpleNamespace(operation="scale", value=0.5)])
     )
+    d_sae, d_in = _widest_source_dims(NARROW_SOURCES[:1])
     assert steer_source_cost(scale) > steer_source_cost(add)
+    assert steer_source_cost(scale) - steer_source_cost(add) < d_sae * d_in, (
+        "a scale request must not be charged the SAE weights the worker already holds"
+    )
 
 
 def test_activation_source_selective_encode_cost_scales_with_selected_positions():

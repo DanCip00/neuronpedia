@@ -2748,8 +2748,8 @@
             ]
           },
           "prefillChunking": {
-            "const": "rejected_if_needed",
-            "default": "rejected_if_needed",
+            "const": "supported",
+            "default": "supported",
             "title": "Prefillchunking",
             "type": "string"
           },

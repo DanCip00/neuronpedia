@@ -204,6 +204,41 @@ def test_baseline_steered_baseline_has_no_cross_request_registration(monkeypatch
     assert register_spec["decoder_vectors"]["1"] == [0.0, 1.0, 0.0]
 
 
+def test_both_arms_take_private_kv_so_the_baseline_prefill_is_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, manager = _VLLMModel(), _Manager()
+    _patch_runtime(monkeypatch, model, manager)
+    prompts: list[dict[str, Any]] = []
+    original = model._prompt
+
+    def recording_prompt(token_ids: list[int], private_kv_for: str | None = None) -> dict[str, Any]:
+        built = original(token_ids, private_kv_for=private_kv_for)
+        prompts.append(built)
+        return built
+
+    monkeypatch.setattr(model, "_prompt", recording_prompt)
+
+    asyncio.run(_call(_request()))
+    asyncio.run(_call(_request([{"featureIndex": 1, "operation": "add", "value": 2.0}])))
+
+    assert [prompt["private_kv_for"] for prompt in prompts] == ["np-sae-base-1", "np-sae-steer-2"]
+
+
+def test_prompt_longer_than_one_prefill_step_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker finds the edited row in whichever prefill chunk holds it, so nothing to refuse."""
+    model, manager = _VLLMModel(), _Manager()
+    model._engine_kwargs = {"max_num_batched_tokens": 2}
+    _patch_runtime(monkeypatch, model, manager)
+
+    response = asyncio.run(_call(_request([{"featureIndex": 1, "operation": "add", "value": 2.0}])))
+
+    assert response["generatedTokenIds"] == [7]
+    assert response["resolved"]["prefillChunking"] == "supported"
+    assert [method for method, _args in model.engine.calls] == [
+        "register_sae_feature_steering",
+        "unregister_sae_feature_steering",
+    ]
+
+
 def test_resolved_features_echo_every_effective_operation(monkeypatch: pytest.MonkeyPatch) -> None:
     model, manager = _VLLMModel(), _Manager()
     _patch_runtime(monkeypatch, model, manager)

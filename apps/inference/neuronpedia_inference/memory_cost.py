@@ -162,6 +162,12 @@ def steer_source_cost(request) -> int:  # type: ignore[no-untyped-def]
     prediction-producing rows, but under each-token steering that can happen once per decode
     step. Reserve one flat steer budget plus enough room for the largest possible per-row SAE
     encode for the selected source.
+
+    The encoder itself is not charged per request: the vLLM worker loads it on the first
+    scale/ablate request and keeps it resident (``vllm_sae_worker._WORKER_SAE_CACHE``), so it
+    is a one-off cost paid out of the slack the transient budget leaves, not a working set
+    that grows with concurrency. Charging it per request capped concurrent ablations at a
+    fraction of ``max_concurrent`` for memory no request was actually using.
     """
     source = getattr(getattr(request, "steering", None), "source", None)
     sources = [source] if source else []
@@ -181,10 +187,8 @@ def steer_source_cost(request) -> int:  # type: ignore[no-untyped-def]
     feature_count = len(effective)
     decoder_rows = max(1, feature_count) * d_in * _sae_dtype_bytes()
     needs_encoder = any(str(getattr(feature, "operation", "")) in {"scale", "ablate"} for feature in effective)
-    # Scale/ablation hold one request-scoped worker copy of the SAE; additive edits do not.
-    sae_weights = 2 * d_sae * d_in * _sae_dtype_bytes() if needs_encoder else 0
     encode_row = _encode_bytes(d_sae, 1) if needs_encoder else 0
-    return int(FLAT_STEER_BYTES + _OVERHEAD_FACTOR * (sae_weights + encode_row + decoder_rows))
+    return int(FLAT_STEER_BYTES + _OVERHEAD_FACTOR * (encode_row + decoder_rows))
 
 
 def steer_cost(request) -> int:  # type: ignore[no-untyped-def] # noqa: ARG001

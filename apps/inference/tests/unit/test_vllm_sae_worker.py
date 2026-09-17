@@ -128,9 +128,9 @@ def test_each_generated_token_positions_advance_across_decode_calls() -> None:
     )
     modifier(torch.zeros(1, 3))
     modifier(torch.zeros(1, 3))
-    modifier(torch.zeros(2, 3))
-    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(0, 1), (1, 1), (2, 2)]
-    assert [entry["edit_count"] for entry in diagnostics] == [1, 1, 2]
+    modifier(torch.zeros(1, 3))
+    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(0, 1), (1, 1), (2, 1)]
+    assert [entry["edit_count"] for entry in diagnostics] == [1, 1, 1]
 
 
 def test_additive_modifier_uses_supplied_vectors_without_loading_sae(monkeypatch) -> None:
@@ -176,16 +176,51 @@ def test_noop_add_reports_zero_edits_and_advances_position(monkeypatch) -> None:
     ]
 
 
-def test_rejects_chunked_or_ambiguous_initial_prefill() -> None:
+@pytest.mark.parametrize("policy", ["next_token", "each_generated_token"])
+def test_chunked_prefill_edits_the_final_prompt_row_in_whichever_chunk_holds_it(policy: str) -> None:
+    """vLLM splits a prompt across steps whenever other requests hold the token budget."""
+    diagnostics: list[dict] = []
     modifier = _make_sae_modifier(
-        _spec("each_generated_token", "add"),
+        _spec(policy, "add"),
+        dev=torch.device("cpu"),
+        dt=torch.float32,
+        prompt_len=5,
+        diag_store=diagnostics,
+    )
+    edited = torch.tensor([[0.0, 2.0, 0.0]])
+    # Chunks of 2, 2 and 1 rows: only the last row of the prompt (position 4) is edited.
+    torch.testing.assert_close(modifier(torch.zeros(2, 3)), torch.zeros(2, 3))
+    torch.testing.assert_close(modifier(torch.zeros(2, 3)), torch.zeros(2, 3))
+    torch.testing.assert_close(modifier(torch.zeros(1, 3)), edited)
+    # Then a chunk boundary that lands mid-way: prompt rows 3 (untouched) and 4 (edited) together.
+    diagnostics.clear()
+    modifier2 = _make_sae_modifier(
+        _spec(policy, "add"), dev=torch.device("cpu"), dt=torch.float32, prompt_len=5, diag_store=diagnostics
+    )
+    torch.testing.assert_close(modifier2(torch.zeros(3, 3)), torch.zeros(3, 3))
+    torch.testing.assert_close(modifier2(torch.zeros(2, 3)), torch.cat([torch.zeros(1, 3), edited]))
+    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(4, 1)]
+    # Decode rows follow the policy.
+    decode = modifier2(torch.zeros(1, 3))
+    torch.testing.assert_close(decode, edited if policy == "each_generated_token" else torch.zeros(1, 3))
+
+
+def test_recompute_after_preemption_restarts_position_tracking() -> None:
+    diagnostics: list[dict] = []
+    modifier = _make_sae_modifier(
+        _spec("next_token", "add"),
         dev=torch.device("cpu"),
         dt=torch.float32,
         prompt_len=3,
-        diag_store=[],
+        diag_store=diagnostics,
     )
-    with pytest.raises(ValueError, match="requires an unchunked initial prefill"):
-        modifier(torch.zeros(1, 3))
+    edited_last = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    torch.testing.assert_close(modifier(torch.zeros(3, 3)), edited_last)
+    torch.testing.assert_close(modifier(torch.zeros(1, 3)), torch.zeros(1, 3))
+    # A multi-row forward after decoding began is vLLM recomputing the preempted prompt: the
+    # final prompt row must be edited again, or the steering would silently vanish.
+    torch.testing.assert_close(modifier(torch.zeros(3, 3)), edited_last)
+    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(2, 1), (2, 1)]
 
 
 def test_modifier_delta_changes_downstream_logits_but_capture_clone_does_not() -> None:
@@ -217,21 +252,26 @@ def test_modifier_delta_changes_downstream_logits_but_capture_clone_does_not() -
     assert int(steered_logits.argmax(dim=-1).item()) == 1
 
 
-def test_unregister_releases_request_scoped_sae(monkeypatch) -> None:
+def test_unregister_drops_the_request_but_keeps_the_sae_resident(monkeypatch) -> None:
+    """Loading an SAE per scale/ablate request cost ~5 s each; the worker keeps it across requests."""
+    loads: list[tuple] = []
     sae = WorkerTinySAE()
     sae_ref = weakref.ref(sae)
-    sae_holder = [sae]
-    monkeypatch.setattr(
-        "neuronpedia_inference.vllm_sae_worker._load_worker_sae",
-        lambda *_args, **_kwargs: sae_holder.pop(),
-    )
-    modifier = _make_sae_modifier(
-        _spec("next_token", "scale"),
-        dev=torch.device("cpu"),
-        dt=torch.float32,
-        prompt_len=1,
-        diag_store=[],
-    )
+    loadable = [sae]
+
+    def fake_load(release, sae_id, device, dtype):  # noqa: ANN001
+        loads.append((release, sae_id, device, dtype))
+        return loadable.pop(), "blocks.0.hook_resid_post"
+
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker.SaeLensSAE.load", staticmethod(fake_load))
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._WORKER_SAE_CACHE", {})
+
+    def make() -> object:
+        return _make_sae_modifier(
+            _spec("next_token", "scale"), dev=torch.device("cpu"), dt=torch.float32, prompt_len=1, diag_store=[]
+        )
+
+    modifier = make()
 
     class Demux:
         steer_mods = {"request": {"site": (modifier, set(), 1)}}
@@ -244,4 +284,6 @@ def test_unregister_releases_request_scoped_sae(monkeypatch) -> None:
     del sae
     worker_unregister_sae_feature_steering(object(), "request")
     gc.collect()
-    assert sae_ref() is None
+    assert sae_ref() is not None, "the SAE must stay resident for the next request"
+    make()
+    assert loads == [("toy-release", "layer0", "cpu", "float32")], "second request must not reload the SAE"

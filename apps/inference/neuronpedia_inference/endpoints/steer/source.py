@@ -320,18 +320,13 @@ async def steer_source(request: SourceSteerRequest):
                     content={"error": "/v1/steer/source does not currently support speculative decoding"},
                     status_code=400,
                 )
-        if spec is not None and len(model_ids) > (
-            getattr(model, "_engine_kwargs", {}).get("max_num_batched_tokens") or 10**12
-        ):
-            return JSONResponse(
-                content={
-                    "error": "SAE source steering requires the prompt prefill to fit in one vLLM forward; shorten the prompt or raise max_num_batched_tokens"
-                },
-                status_code=400,
-            )
         await model._ensure_engine()
         rid = model._new_request_id("np-sae-steer" if spec is not None else "np-sae-base")
-        prompt = model._prompt(model_ids, private_kv_for=rid if spec is not None else None)
+        # The baseline takes private KV too. A steered request must (its KV is computed from an
+        # edited residual), and a baseline that could hit the prefix cache would have its prompt
+        # KV come from some earlier request's forward instead of its own, which is one more
+        # difference between the two arms of a comparison than the intervention itself.
+        prompt = model._prompt(model_ids, private_kv_for=rid)
         sampling = SamplingParams(
             max_tokens=max_new_tokens,
             temperature=float(request.temperature),

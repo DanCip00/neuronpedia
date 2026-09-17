@@ -393,7 +393,9 @@ class SourceSteerResolvedMetadata(BaseSchema):
     position_policy: SAEInterventionPositionPolicy | None = None
     features: list[SourceSteerFeature] = Field(default_factory=list)
     backend: Literal["vllm"] = "vllm"
-    prefill_chunking: Literal["rejected_if_needed"] = "rejected_if_needed"
+    # The worker tracks each request's absolute row position, so the edited row is found in
+    # whichever prefill chunk vLLM schedules it in; nothing is rejected on that account.
+    prefill_chunking: Literal["supported"] = "supported"
 
 
 class SourceSteerInterventionDiagnostics(BaseSchema):

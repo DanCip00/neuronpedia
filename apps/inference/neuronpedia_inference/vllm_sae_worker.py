@@ -14,15 +14,23 @@ from neuronpedia_inference.saes.saelens import SaeLensSAE
 
 PositionPolicy = Literal["next_token", "each_generated_token"]
 
+# One entry per distinct SAE this worker process has been asked to encode with. Loading an SAE
+# from disk into the GPU took ~5 s per request when it was done per request (an 80k x 5120
+# SAE is 1.6 GB in bf16), and scale/ablate need the whole encoder for TopK selection, so the
+# only way to make those requests cost what an `add` costs is to keep the SAE resident. This
+# process serves one model with a handful of SAE sets, so the dict stays small.
+_WORKER_SAE_CACHE: dict[tuple[str, str, str, str], object] = {}
+
 
 def _load_worker_sae(spec: dict[str, Any], device: torch.device, dtype: torch.dtype) -> object:
-    sae, _hook = SaeLensSAE.load(
-        str(spec["release"]),
-        str(spec["sae_id"]),
-        str(device),
-        str(spec.get("dtype") or str(dtype).removeprefix("torch.")),
-    )
-    return sae
+    """Return the SAE named by ``spec``, loading it on first use in this worker process."""
+    dtype_name = str(spec.get("dtype") or str(dtype).removeprefix("torch."))
+    key = (str(spec["release"]), str(spec["sae_id"]), str(device), dtype_name)
+    cached = _WORKER_SAE_CACHE.get(key)
+    if cached is None:
+        cached, _hook = SaeLensSAE.load(key[0], key[1], key[2], key[3])
+        _WORKER_SAE_CACHE[key] = cached
+    return cached
 
 
 def _features(spec: dict[str, Any]) -> list[SAEFeatureIntervention]:
@@ -60,31 +68,35 @@ def _make_sae_modifier(
         sae = _load_worker_sae(spec["sae"], dev, dt)
     policy: PositionPolicy = spec["position_policy"]
     want_diag = bool(spec.get("return_diagnostics", False))
-    prefill_seen = False
-    next_decode_position = prompt_len
+    # Absolute position of the next row this request will show the hook. The hook only sees the
+    # rows scheduled this step, so the position has to be tracked here: vLLM may split a prompt
+    # across steps (chunked prefill, which happens to a short prompt whenever other requests
+    # hold the token budget), and the row to edit is the one at prompt_len - 1 whichever chunk
+    # it lands in. Raising here instead would surface inside the model forward and take the
+    # engine down, not just this request.
+    next_position = 0
 
     def _modify(full: torch.Tensor) -> torch.Tensor:
-        nonlocal next_decode_position, prefill_seen
+        nonlocal next_position
         delta = torch.zeros_like(full)
         if full.dim() != 2:
             raise ValueError(f"SAE source steering supports 2-D residual rows only, got {tuple(full.shape)}")
-        if not prefill_seen:
-            if full.shape[0] != prompt_len:
-                raise ValueError(
-                    "SAE source steering requires an unchunked initial prefill: "
-                    f"expected {prompt_len} request rows, received {full.shape[0]}"
-                )
-            prefill_seen = True
-            is_prefill = True
-            rows = full[-1:]
-            row_offset = prompt_len - 1
-        elif policy == "each_generated_token":
-            is_prefill = False
-            rows = full
-            row_offset = next_decode_position
-            next_decode_position += int(rows.shape[0])
-        else:
+        num_rows = int(full.shape[0])
+        if num_rows > 1 and next_position >= prompt_len:
+            # Once decoding has begun a request advances one row per step (speculative decoding
+            # is refused at the API), so several rows at once means vLLM preempted the request
+            # and is recomputing its prompt from the start.
+            next_position = 0
+        start = next_position
+        next_position += num_rows
+        # Rows to edit, in absolute positions: prompt_len - 1 always (it predicts the first
+        # generated token); everything after it as well under each_generated_token.
+        lo = max(start, prompt_len - 1)
+        hi = start + num_rows if policy == "each_generated_token" else min(start + num_rows, prompt_len)
+        if lo >= hi:
             return delta
+        rows = full[lo - start : hi - start]
+        row_offset = lo
         row_delta, diagnostics = sae_intervention_delta(
             rows,
             sae,
@@ -92,10 +104,7 @@ def _make_sae_modifier(
             return_diagnostics=want_diag,
             decoder_vectors_by_feature=decoder_vectors,
         )
-        if is_prefill:
-            delta[-1:] = row_delta
-        else:
-            delta[:] = row_delta
+        delta[lo - start : hi - start] = row_delta
         if diagnostics is not None:
             diag_store.append(
                 {
