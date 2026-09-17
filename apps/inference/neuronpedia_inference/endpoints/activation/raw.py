@@ -47,7 +47,8 @@ _LOW_PRECISION_DTYPES = {"float16", "bfloat16", "float8"}
 
 
 @router.post("/activation/raw", responses={200: {"model": ActivationRawResponse}})
-@with_request_lock(exclusive=False, cost=activation_raw_cost)
+# Keep this pre-SAE diagnostic on the same isolated execution path as /activation/source.
+@with_request_lock(exclusive=True, cost=activation_raw_cost)
 async def activation_raw(request: ActivationRawRequest):
     config = Config.get_instance()
     config.check_requested_model(request.model)

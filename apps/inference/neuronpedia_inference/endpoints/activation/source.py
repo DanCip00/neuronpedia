@@ -388,7 +388,9 @@ def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
 
 
 @router.post("/activation/source", responses={200: {"model": ActivationSourceResponse}})
-@with_request_lock(exclusive=False, cost=activation_source_cost)
+# Reduced-precision vLLM kernels can follow a different numerical path when continuous
+# batching changes. Feature-comparison experiments require repeatable hidden states.
+@with_request_lock(exclusive=True, cost=activation_source_cost)
 async def activation_source(request: ActivationSourceRequest):
     Config.get_instance().check_requested_model(request.model)
     try:

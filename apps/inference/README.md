@@ -411,6 +411,12 @@ default to no BOS, EOS, chat template, or other special-token insertion and are 
 to the model. `activeFeatures` stores `[modelPosition, activation]` pairs, so its positions always
 index `modelInputTokenIds`.
 
+Source and raw-residual extraction run with exclusive model admission. This prevents vLLM
+continuous batching from changing reduced-precision kernel numerics between otherwise identical
+observations. Concurrent extraction requests therefore queue, while ordinary generation remains
+concurrent whenever no extraction is active. For paired comparisons, putting both exact-token rows
+in one request also preserves their order and avoids an extra admission round trip.
+
 Text and token inputs may explicitly request an insertion policy:
 
 ```json
