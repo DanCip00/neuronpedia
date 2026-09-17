@@ -168,37 +168,3 @@ def test_the_globals_are_what_the_decorator_uses():
     """Guards the fixture above: if these stop being module attributes it patches nothing."""
     assert isinstance(limiter, ConcurrencyLimiter)
     assert isinstance(budget, VramBudget)
-
-
-@async_test
-async def test_exclusive_slot_drains_shared_work_and_blocks_new_shared_requests():
-    limiter = ConcurrencyLimiter()
-    limiter.configure(concurrent=True, max_concurrent=2)
-    first_shared = await limiter.acquire(exclusive=False)
-
-    exclusive_task = asyncio.create_task(limiter.acquire(exclusive=True))
-    await asyncio.sleep(0)
-    assert not exclusive_task.done()
-
-    later_shared_task = asyncio.create_task(limiter.acquire(exclusive=False))
-    await asyncio.sleep(0)
-    assert not later_shared_task.done()
-
-    first_shared.release()
-    exclusive = await exclusive_task
-    assert not later_shared_task.done()
-
-    exclusive.release()
-    later_shared = await later_shared_task
-    later_shared.release()
-
-
-@async_test
-async def test_shared_fail_fast_refuses_while_exclusive_slot_is_held():
-    limiter = ConcurrencyLimiter()
-    limiter.configure(concurrent=True, max_concurrent=2)
-
-    async with limiter.slot(exclusive=True):
-        with pytest.raises(RequestBusy):
-            async with limiter.slot(exclusive=False, fail_if_busy=True):
-                pass

@@ -156,10 +156,16 @@ class VramBudget:
 class ConcurrencyLimiter:
     """Admit requests based on backend concurrency-safety.
 
-    Shared vLLM requests use a bounded semaphore so the engine can batch them. Exclusive
-    requests close a writer gate and drain every semaphore permit before running, which
-    guarantees that no shared request can overlap them. Non-vLLM backends remain strictly
-    one-at-a-time regardless of the requested mode.
+    - **vLLM** (``concurrent=True``): up to ``max_concurrent`` requests run in flight
+      (a semaphore; vLLM batches them). The per-request demux (``vllm_capture/requests.py``)
+      makes the worker hooks per-request-safe, so the capture/steer/lens/persona
+      endpoints now also pass ``exclusive=False`` and run N-way concurrent. The
+      EXCLUSIVE lock remains available for any future op that must serialize globally.
+    - **non-vLLM** (EagerModel on CUDA/MPS/CPU): a single mutex -> strictly one
+      request at a time (eager forward + global hooks are not concurrency-safe),
+      regardless of ``exclusive``.
+
+    Configured once at startup from :mod:`startup_memory` limits.
     """
 
     def __init__(self) -> None:
@@ -168,13 +174,11 @@ class ConcurrencyLimiter:
         self._sem = asyncio.Semaphore(1)
         self._exclusive = asyncio.Lock()
         self._single = asyncio.Lock()
-        self._active_shared = 0
 
     def configure(self, *, concurrent: bool, max_concurrent: int) -> None:
         self._concurrent = bool(concurrent)
         self._max = max(1, int(max_concurrent))
         self._sem = asyncio.Semaphore(self._max)
-        self._active_shared = 0
         logger.info(
             "[LIMITER] configured concurrent=%s max_concurrent=%d",
             self._concurrent,
@@ -185,52 +189,22 @@ class ConcurrencyLimiter:
     def max_concurrent(self) -> int:
         return self._max if self._concurrent else 1
 
-    def is_busy(self, exclusive: bool = True) -> bool:
+    def _primitive(self, exclusive: bool):
         if not self._concurrent:
-            return self._single.locked()
-        if exclusive:
-            return self._exclusive.locked() or self._active_shared > 0
-        return self._exclusive.locked() or self._sem.locked()
+            return self._single  # one-at-a-time for every request
+        return self._exclusive if exclusive else self._sem
 
-    async def _acquire_shared(self):  # type: ignore[no-untyped-def]
-        # Pass through the writer gate before taking capacity. An exclusive waiter holds
-        # this gate while existing readers drain, so new shared work cannot join its batch.
-        await self._exclusive.acquire()
-        try:
-            await self._sem.acquire()
-        finally:
-            self._exclusive.release()
-        self._active_shared += 1
-        return _SharedConcurrencyLease(self)
-
-    async def _acquire_exclusive(self):  # type: ignore[no-untyped-def]
-        await self._exclusive.acquire()
-        acquired = 0
-        try:
-            for _ in range(self._max):
-                await self._sem.acquire()
-                acquired += 1
-        except BaseException:
-            for _ in range(acquired):
-                self._sem.release()
-            self._exclusive.release()
-            raise
-        return _ExclusiveConcurrencyLease(self)
+    def is_busy(self, exclusive: bool = True) -> bool:
+        return self._primitive(exclusive).locked()
 
     async def acquire(self, *, exclusive: bool = True, timeout: float = REQUEST_LOCK_TIMEOUT):
-        """Acquire and return a lease that the caller must release."""
-        if not self._concurrent:
-            primitive = self._single
-            if timeout and timeout > 0:
-                await asyncio.wait_for(primitive.acquire(), timeout=timeout)
-            else:
-                await primitive.acquire()
-            return primitive
-
-        acquire = self._acquire_exclusive() if exclusive else self._acquire_shared()
+        """Acquire and RETURN the underlying primitive (caller must ``release`` it)."""
+        primitive = self._primitive(exclusive)
         if timeout and timeout > 0:
-            return await asyncio.wait_for(acquire, timeout=timeout)
-        return await acquire
+            await asyncio.wait_for(primitive.acquire(), timeout=timeout)
+        else:
+            await primitive.acquire()
+        return primitive
 
     @asynccontextmanager
     async def slot(
@@ -240,44 +214,14 @@ class ConcurrencyLimiter:
         fail_if_busy: bool = False,
         timeout: float = REQUEST_LOCK_TIMEOUT,
     ):
-        if fail_if_busy and self.is_busy(exclusive):
+        primitive = self._primitive(exclusive)
+        if fail_if_busy and primitive.locked():
             raise RequestBusy()
         acquired = await self.acquire(exclusive=exclusive, timeout=timeout)
         try:
             yield
         finally:
             acquired.release()
-
-
-class _SharedConcurrencyLease:
-    """One shared vLLM capacity permit."""
-
-    def __init__(self, limiter: ConcurrencyLimiter) -> None:
-        self._limiter = limiter
-        self._released = False
-
-    def release(self) -> None:
-        if self._released:
-            raise RuntimeError("Concurrency lease released twice")
-        self._released = True
-        self._limiter._active_shared -= 1
-        self._limiter._sem.release()
-
-
-class _ExclusiveConcurrencyLease:
-    """Every vLLM capacity permit plus the gate that blocks new shared work."""
-
-    def __init__(self, limiter: ConcurrencyLimiter) -> None:
-        self._limiter = limiter
-        self._released = False
-
-    def release(self) -> None:
-        if self._released:
-            raise RuntimeError("Concurrency lease released twice")
-        self._released = True
-        for _ in range(self._limiter._max):
-            self._limiter._sem.release()
-        self._limiter._exclusive.release()
 
 
 # Global limiter (configured at startup via configure_limiter()).
@@ -376,9 +320,9 @@ def _estimate_sae_residency(args, kwargs) -> int:  # type: ignore[no-untyped-def
 def with_request_lock(exclusive: bool = True, cost=None):  # type: ignore[no-untyped-def]
     """Decorator: admit the handler through the limiter, and optionally the VRAM budget.
 
-    ``exclusive=True`` (default) is the safe choice: it runs alone on every backend,
-    draining in-flight shared vLLM work before entering. Concurrency-safe endpoints pass
-    ``exclusive=False`` to run concurrently on vLLM.
+    ``exclusive=True`` (default) is the safe choice -- serialized on non-vLLM and
+    among hook-based endpoints on vLLM. Concurrency-safe endpoints (tokenize, util)
+    pass ``exclusive=False`` to run concurrently on vLLM.
 
     ``cost`` is a callable taking the handler's request model and returning the estimated
     peak working-set bytes. Endpoints that pass one are additionally admitted against the

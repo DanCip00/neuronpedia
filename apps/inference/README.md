@@ -411,11 +411,27 @@ default to no BOS, EOS, chat template, or other special-token insertion and are 
 to the model. `activeFeatures` stores `[modelPosition, activation]` pairs, so its positions always
 index `modelInputTokenIds`.
 
-Source and raw-residual extraction run with exclusive model admission. This prevents vLLM
-continuous batching from changing reduced-precision kernel numerics between otherwise identical
-observations. Concurrent extraction requests therefore queue, while ordinary generation remains
-concurrent whenever no extraction is active. For paired comparisons, putting both exact-token rows
-in one request also preserves their order and avoids an extra admission round trip.
+Rows that share a causal prefix agree on it exactly, within one request. Two rows that are
+forwarded separately on vLLM (as separate engine requests, in whatever batch the scheduler
+forms) do **not** agree bitwise on their shared prefix in bf16: the disagreement grows with
+prompt length and a TopK SAE turns it into different feature values or support. No admission
+policy fixes that -- serializing requests and grouping rows were both tried and both still
+failed 15-60% of pairs -- so the server does not try to control scheduling at all. Instead,
+`/activation/source` reads every requested position from the *first* row in the request whose
+tokens agree with it through that position, because a hidden state at `p` depends only on
+`tokens[:p+1]`. Two rows `prefix + a` and `prefix + b` that each ask for the last prefix position
+and their own candidate still need two forwards, but the prefix position is taken from the first
+row's capture for both and is therefore identical. Selective extraction also forwards only the
+causal prefix through the latest requested position, captures identical forwarded rows once, and
+SAE-encodes each distinct `(owning row, position)` hidden vector once; logical rows are expanded
+back into input order with their complete submitted token metadata.
+
+The guarantee is request-scoped and prefix-scoped. Positions whose causal prefix appears in no
+earlier row of the same request -- the candidate tokens themselves, or rows that differ earlier --
+are computed independently and vary at reduced precision, as do results across separate requests.
+Put the rows you need to compare in one request. Admission is the ordinary shared vLLM
+semaphore for both `/activation/source` and `/activation/raw`; within a request every distinct
+row is submitted to the engine at once.
 
 Text and token inputs may explicitly request an insertion policy:
 

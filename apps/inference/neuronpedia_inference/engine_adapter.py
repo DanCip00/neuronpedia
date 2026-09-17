@@ -14,8 +14,9 @@ because they are not redundant dispatch:
   hand back the activation on the device it was computed on, and the encode that consumes it
   is on that device — so routing eager through the protocol would add a GPU->CPU->GPU round
   trip per hook point on the hottest endpoint.
-- **Batched capture** exists eagerly as one padded forward; vLLM has no batched worker
-  capture and has to loop per prompt and scatter.
+- **Batched capture** exists eagerly as one padded forward. vLLM has no batched worker
+  capture, so it is one request per prompt, all submitted at once and scattered back in order;
+  the engine's own scheduler decides how they are batched.
 - **DFA / attention** is the capability split the protocol deliberately excludes: eager reads
   the real softmax, vLLM has to recompute it off-kernel from captured q/k/v.
 
@@ -28,6 +29,7 @@ routing it through both capture paths and refusing a model whose norms are not R
 
 from __future__ import annotations
 
+import asyncio
 from typing import NamedTuple, TypedDict
 
 import einops
@@ -679,8 +681,11 @@ async def capture_padded_cache_async(
     """Backend-aware batched capture -> ``{hook_name: tensor[batch, max_len, d]}`` (right-padded).
 
     EagerModel captures the padded batch in one eager forward (pads are causally harmless and
-    the caller slices to ``original_lengths``). ``VLLMModel`` has no batched worker
-    capture, so it captures each prompt at its true length and scatters into the padded tensor.
+    the caller slices to ``original_lengths``). ``VLLMModel`` has no batched worker capture, so
+    each prompt is its own engine request at its true length; all of them are submitted at once
+    and the engine's scheduler batches them as it sees fit. Nothing here tries to steer that
+    scheduling: rows that must agree bitwise are made to share one captured tensor by the caller
+    (see ``/activation/source``), not by co-scheduling separate forwards.
     """
     points = _capture_points(hook_names)
     if isinstance(model, EagerModel):
@@ -694,14 +699,17 @@ async def capture_padded_cache_async(
         batch, max_len = int(padded_tokens.shape[0]), int(padded_tokens.shape[1])
         # Hoisted: the points are the same for every prompt in the batch.
         layers = _native_resid_layers(points) if native else []
-        per_prompt = []
-        for i in range(batch):
-            ids = padded_tokens[i, : original_lengths[i]].tolist()
+
+        async def capture_one(index: int) -> dict[Address, torch.Tensor]:
+            ids = padded_tokens[index, : original_lengths[index]].tolist()
             if native:
                 resid = await model.capture_resid_post(ids, layers)
-                per_prompt.append({p.address: resid[layer] for p, layer in zip(points, layers, strict=True)})
-            else:
-                per_prompt.append(await model.capture(ids, [point.address for point in points]))
+                return {point.address: resid[layer] for point, layer in zip(points, layers, strict=True)}
+            return await model.capture(ids, [point.address for point in points])
+
+        # gather rather than a TaskGroup: the endpoints' OOM recovery inspects the raised
+        # exception directly, and an ExceptionGroup would hide it.
+        per_prompt = await asyncio.gather(*(capture_one(index) for index in range(batch)))
         out: dict[str, torch.Tensor] = {}
         for point in points:
             sample = per_prompt[0][point.address]

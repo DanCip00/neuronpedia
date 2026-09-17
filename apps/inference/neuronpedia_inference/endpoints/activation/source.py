@@ -1,5 +1,6 @@
 import base64
 import logging
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -41,12 +42,26 @@ class _PreparedInput:
     legacy_compat: bool = False
 
 
-def _tokenizer_ids(tokenizer: Any) -> set[int]:
-    """Return every ID the selected tokenizer can name, including added tokens."""
-    return {int(token_id) for token_id in tokenizer.get_vocab().values()}
+# Keyed by object identity, holding the tokenizer so the key cannot be recycled by a new object.
+_VALID_IDS_BY_TOKENIZER: dict[int, tuple[Any, frozenset[int]]] = {}
 
 
-def _validate_ids(ids: list[int], valid_ids: set[int], input_index: int, field: str) -> None:
+def _tokenizer_ids(tokenizer: Any) -> frozenset[int]:
+    """Return every ID the selected tokenizer can name, including added tokens.
+
+    Computed once per tokenizer object. ``get_vocab()`` materializes the whole vocabulary --
+    250k entries for Qwen -- and doing that per request cost ~150 ms, more than the model
+    forward for a 400-token row. The vocabulary of a loaded tokenizer does not change.
+    """
+    cached = _VALID_IDS_BY_TOKENIZER.get(id(tokenizer))
+    if cached is not None and cached[0] is tokenizer:
+        return cached[1]
+    valid_ids = frozenset(int(token_id) for token_id in tokenizer.get_vocab().values())
+    _VALID_IDS_BY_TOKENIZER[id(tokenizer)] = (tokenizer, valid_ids)
+    return valid_ids
+
+
+def _validate_ids(ids: list[int], valid_ids: AbstractSet[int], input_index: int, field: str) -> None:
     """Reject an ID before it can become an embedding lookup/device-side assert."""
     for position, token_id in enumerate(ids):
         if token_id not in valid_ids:
@@ -74,7 +89,7 @@ def _apply_insertion(
     input_ids: list[int],
     insertion: ActivationSourceInsertion,
     tokenizer: Any,
-    valid_ids: set[int],
+    valid_ids: AbstractSet[int],
     input_index: int,
 ) -> tuple[list[int], list[ActivationSourceTokenAlignment], list[int]]:
     """Apply the documented boundary order and construct an exact position map."""
@@ -193,7 +208,9 @@ def _chat_byte_offsets(tokenizer: Any, rendered: str, model_ids: list[int]) -> l
     ]
 
 
-def _prepare_chat(model: Any, row: ActivationSourceChatInput, input_index: int, valid_ids: set[int]) -> _PreparedInput:
+def _prepare_chat(
+    model: Any, row: ActivationSourceChatInput, input_index: int, valid_ids: AbstractSet[int]
+) -> _PreparedInput:
     tok = get_tokenize(model)
     if not tok.has_chat_template():
         raise ValueError("The selected model has no configured chat template; use text or tokens input")
@@ -327,6 +344,73 @@ def _resolve_activation_positions(
     return resolved_by_input
 
 
+def _common_prefix_length(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    """Number of leading positions on which two token sequences agree."""
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit
+
+
+def _causal_owner_by_position(capture_tokens: list[tuple[int, ...]]) -> list[list[int]]:
+    """For each capture row and position, the earliest capture row sharing that causal prefix.
+
+    A hidden state at position ``p`` depends only on ``tokens[:p + 1]``, so every capture row that
+    agrees through ``p`` holds the same value there in exact arithmetic. Separate vLLM forwards do
+    not honour that identity in reduced precision: the two rows of a shared-prefix pair land in
+    different batch shapes or prefill chunks and disagree at ``p`` by a few bf16 ulps, which a TopK
+    SAE turns into different feature values or support. Reading every causal prefix from one
+    canonical row -- the first in request order that contains it -- makes the shared positions
+    bitwise identical regardless of how the engine scheduled the rows.
+
+    Consistency follows from the choice of "earliest": two rows that agree through ``p`` see the
+    same set of earlier rows agreeing through ``p``, so they pick the same owner.
+    """
+    owners: list[list[int]] = []
+    for index, tokens in enumerate(capture_tokens):
+        row_owners = [index] * len(tokens)
+        # Walk earlier rows from nearest to first so the earliest match is the one that sticks.
+        for earlier in reversed(range(index)):
+            shared = _common_prefix_length(capture_tokens[earlier], tokens)
+            row_owners[:shared] = [earlier] * shared
+        owners.append(row_owners)
+    return owners
+
+
+def _sparse_all_positions(
+    encoded_by_capture: list[np.ndarray], capture_index: int, owners: list[int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Nonzero ``(position, feature, value)`` triples for one row, honouring position owners.
+
+    Positions owned by another capture row (typically just a shared BOS or chat header) are
+    swapped in individually rather than by rebuilding the whole ``[seq, d_sae]`` array, which
+    for an 80k-feature SAE is a ~130 MB copy per 400-token row. Output is sorted by
+    ``(position, feature)``, the same order ``np.nonzero`` yields on an unshared row.
+    """
+    own = encoded_by_capture[capture_index]
+    token_indices, feature_indices = np.nonzero(own)
+    borrowed = [position for position, owner in enumerate(owners) if owner != capture_index]
+    if not borrowed:
+        return token_indices, feature_indices, own[token_indices, feature_indices]
+
+    keep = ~np.isin(token_indices, borrowed)
+    tokens = [token_indices[keep]]
+    features = [feature_indices[keep]]
+    values = [own[tokens[0], features[0]]]
+    for position in borrowed:
+        owner_row = encoded_by_capture[owners[position]][position]
+        active = np.nonzero(owner_row)[0]
+        tokens.append(np.full(active.shape, position, dtype=token_indices.dtype))
+        features.append(active)
+        values.append(owner_row[active])
+    token_indices = np.concatenate(tokens)
+    feature_indices = np.concatenate(features)
+    activation_values = np.concatenate(values)
+    order = np.lexsort((feature_indices, token_indices))
+    return token_indices[order], feature_indices[order], activation_values[order]
+
+
 def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
     model = Model.get_instance()
     tokenizer = model.tokenizer
@@ -388,9 +472,9 @@ def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
 
 
 @router.post("/activation/source", responses={200: {"model": ActivationSourceResponse}})
-# Reduced-precision vLLM kernels can follow a different numerical path when continuous
-# batching changes. Feature-comparison experiments require repeatable hidden states.
-@with_request_lock(exclusive=True, cost=activation_source_cost)
+# Shared admission is fine here: rows that must agree read one captured tensor (see
+# _causal_owner_by_position), so nothing depends on how vLLM batches concurrent requests.
+@with_request_lock(exclusive=False, cost=activation_source_cost)
 async def activation_source(request: ActivationSourceRequest):
     Config.get_instance().check_requested_model(request.model)
     try:
@@ -410,7 +494,14 @@ class ActivationProcessor:
     async def process_activations_batch(
         self, request: ActivationSourceRequest, prepared: list[_PreparedInput]
     ) -> list[ActivationSourceResult]:
-        """Capture one ordered padded batch and encode each unpadded row."""
+        """Capture each distinct forwarded row once and read every causal prefix from one row.
+
+        Two levels of reuse, both request-scoped. Rows whose forwarded tokens (truncated after the
+        latest requested position) are identical share one capture. Beyond that, any position whose
+        causal prefix also appears in an earlier capture row is read from that earlier row, so a
+        shared-prefix pair agrees bitwise on the prefix even when each row also asks for a position
+        past it and therefore needs its own forward.
+        """
         model = Model.get_instance()
         sae_manager = SAEManager.get_instance()
         config = Config.get_instance()
@@ -428,32 +519,53 @@ class ActivationProcessor:
                     f"Input {index} is too long: {len(row.model_token_ids)} tokens, max is {int(batch_token_limit)}"
                 )
 
-        max_len = max(len(row.model_token_ids) for row in prepared)
+        selected_positions_by_input = _resolve_activation_positions(request.activation_positions, prepared)
+        unique_capture_tokens: list[tuple[int, ...]] = []
+        capture_index_by_key: dict[tuple[int, ...], int] = {}
+        capture_index_by_input: list[int] = []
+        for input_index, row in enumerate(prepared):
+            capture_end = (
+                max(selected_positions_by_input[input_index]) + 1
+                if selected_positions_by_input is not None
+                else len(row.model_token_ids)
+            )
+            capture_key = tuple(row.model_token_ids[:capture_end])
+            capture_index = capture_index_by_key.get(capture_key)
+            if capture_index is None:
+                capture_index = len(unique_capture_tokens)
+                capture_index_by_key[capture_key] = capture_index
+                unique_capture_tokens.append(capture_key)
+            capture_index_by_input.append(capture_index)
+
+        max_len = max(len(tokens) for tokens in unique_capture_tokens)
         pad_token_id = model.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = model.tokenizer.eos_token_id
         if pad_token_id is None:
             raise ValueError("Tokenizer has neither a padding token nor an EOS token")
-        padded_tokens = torch.full((batch_size, max_len), int(pad_token_id), dtype=torch.long, device=config.device)
-        original_lengths = [len(row.model_token_ids) for row in prepared]
-        for index, row in enumerate(prepared):
-            padded_tokens[index, : len(row.model_token_ids)] = torch.tensor(
-                row.model_token_ids, dtype=torch.long, device=config.device
-            )
+        padded_tokens = torch.full(
+            (len(unique_capture_tokens), max_len), int(pad_token_id), dtype=torch.long, device=config.device
+        )
+        original_lengths = [len(tokens) for tokens in unique_capture_tokens]
+        for index, tokens in enumerate(unique_capture_tokens):
+            padded_tokens[index, : len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=config.device)
 
         hook_name = sae_manager.get_sae_hook(request.source)
-        selected_positions_by_input = _resolve_activation_positions(request.activation_positions, prepared)
         cache = await capture_padded_cache_async(model, padded_tokens, original_lengths, [hook_name])
         sae = sae_manager.get_sae(request.source)
+        owners_by_capture = _causal_owner_by_position(unique_capture_tokens)
         results: list[ActivationSourceResult] = []
         if selected_positions_by_input is None:
-            for index, row in enumerate(prepared):
-                seq_len = original_lengths[index]
+            encoded_by_capture: list[np.ndarray] = []
+            for capture_index, seq_len in enumerate(original_lengths):
                 with torch.no_grad():
-                    activation_data = cache[hook_name][index : index + 1, :seq_len].to(config.device)
-                    prompt_activations = sae.encode(activation_data)[0].float().cpu().numpy()
-                token_indices, feature_indices = np.nonzero(prompt_activations)
-                activation_values = prompt_activations[token_indices, feature_indices]
+                    activation_data = cache[hook_name][capture_index : capture_index + 1, :seq_len].to(config.device)
+                    encoded_by_capture.append(sae.encode(activation_data)[0].float().cpu().numpy())
+            for input_index, row in enumerate(prepared):
+                capture_index = capture_index_by_input[input_index]
+                token_indices, feature_indices, activation_values = _sparse_all_positions(
+                    encoded_by_capture, capture_index, owners_by_capture[capture_index]
+                )
                 active_features: dict[str, list[list[float]]] = {}
                 for token_idx, feature_idx, activation_value in zip(
                     token_indices, feature_indices, activation_values, strict=True
@@ -477,31 +589,45 @@ class ActivationProcessor:
                 )
             return results
 
-        selected_hidden_states: list[torch.Tensor] = []
-        selected_index: list[tuple[int, int]] = []
+        unique_sae_keys: list[tuple[int, int]] = []
+        sae_index_by_key: dict[tuple[int, int], int] = {}
+        sae_indices_by_input: list[list[int]] = []
         for input_index, positions in enumerate(selected_positions_by_input):
+            owners = owners_by_capture[capture_index_by_input[input_index]]
+            input_sae_indices: list[int] = []
             for position in positions:
-                selected_hidden_states.append(cache[hook_name][input_index, position])
-                selected_index.append((input_index, position))
+                key = (owners[position], position)
+                sae_index = sae_index_by_key.get(key)
+                if sae_index is None:
+                    sae_index = len(unique_sae_keys)
+                    sae_index_by_key[key] = sae_index
+                    unique_sae_keys.append(key)
+                input_sae_indices.append(sae_index)
+            sae_indices_by_input.append(input_sae_indices)
 
-        active_features_by_input: list[dict[str, list[list[float]]]] = [{} for _ in prepared]
-        if selected_hidden_states:
+        selected_activations: np.ndarray | None = None
+        if unique_sae_keys:
+            selected_hidden_states = [
+                cache[hook_name][capture_index, model_position] for capture_index, model_position in unique_sae_keys
+            ]
             with torch.no_grad():
                 selected_hidden = torch.stack(selected_hidden_states).to(config.device)
                 selected_activations = sae.encode(selected_hidden).float().cpu().numpy()
-            for encoded_index, (input_index, model_position) in enumerate(selected_index):
-                row_activations = selected_activations[encoded_index]
+
+        for row, positions, sae_indices in zip(
+            prepared, selected_positions_by_input, sae_indices_by_input, strict=True
+        ):
+            active_features: dict[str, list[list[float]]] = {}
+            assert selected_activations is not None
+            for model_position, sae_index in zip(positions, sae_indices, strict=True):
+                row_activations = selected_activations[sae_index]
                 feature_indices = np.nonzero(row_activations)[0]
                 activation_values = row_activations[feature_indices]
-                active_features = active_features_by_input[input_index]
                 for feature_idx, activation_value in zip(feature_indices, activation_values, strict=True):
                     active_features.setdefault(str(int(feature_idx)), []).append(
                         [int(model_position), round(float(activation_value), ROUND_DECIMALS)]
                     )
 
-        for row, positions, active_features in zip(
-            prepared, selected_positions_by_input, active_features_by_input, strict=True
-        ):
             results.append(
                 ActivationSourceResult(
                     tokens=row.tokens,

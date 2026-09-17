@@ -114,6 +114,36 @@ def test_request_requires_exactly_one_input_mode():
         )
 
 
+def test_tokenizer_vocabulary_is_materialized_once_per_tokenizer(monkeypatch: pytest.MonkeyPatch):
+    """``get_vocab()`` is ~150 ms on a 250k vocabulary, so it must not run per request."""
+    calls = {"count": 0}
+
+    class CountingTokenizer(_Tokenizer):
+        def get_vocab(self):
+            calls["count"] += 1
+            return super().get_vocab()
+
+    class CountingModel(_Model):
+        tokenizer = CountingTokenizer()
+
+    _patch_runtime(monkeypatch)
+    monkeypatch.setattr(source_endpoint.Model, "get_instance", lambda: CountingModel())
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=[[10, 20]],
+    )
+
+    for _ in range(3):
+        source_endpoint._prepare_inputs(request)
+    assert calls["count"] == 1
+
+    # A different tokenizer object is a different vocabulary and gets its own entry.
+    monkeypatch.setattr(CountingModel, "tokenizer", CountingTokenizer())
+    source_endpoint._prepare_inputs(request)
+    assert calls["count"] == 2
+
+
 def test_invalid_exact_token_id_names_input_and_position(monkeypatch: pytest.MonkeyPatch):
     _patch_runtime(monkeypatch)
     request = ActivationSourceRequest(
@@ -179,7 +209,7 @@ def test_configured_source_batch_size_accepts_larger_batch(monkeypatch: pytest.M
     results = asyncio.run(source_endpoint.ActivationProcessor().process_activations_batch(request, prepared))
 
     assert len(results) == 5
-    assert captured["lengths"] == [1, 1, 1, 1, 1]
+    assert captured["lengths"] == [1]
 
 
 def test_insertion_alignment_is_explicit(monkeypatch: pytest.MonkeyPatch):
@@ -478,6 +508,252 @@ def test_selective_positions_are_encoded_together_without_full_sequence(monkeypa
     )
 
     assert sae.encode_shapes == [(2, 3)]
+
+
+def test_shared_causal_prefix_is_captured_and_encoded_once(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    prefix = [10, 20, 30]
+    rows = [prefix + [40], prefix + [50]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+        activation_positions=[[2], [2]],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [prefix]
+    assert captured["lengths"] == [len(prefix)]
+    assert sae.encode_shapes == [(1, 3)]
+    assert [result.model_input_token_ids for result in results] == rows
+    assert results[0].active_features == {"0": [[2, 3.0]], "1": [[2, 1.0]]}
+    assert results[0].active_features == results[1].active_features
+    assert results[0].active_features is not results[1].active_features
+
+
+def test_shared_prefix_stays_exact_when_rows_also_request_their_own_suffix(monkeypatch: pytest.MonkeyPatch):
+    """The live pipeline asks for the prefix end AND the candidate token, so each row needs its own
+    forward. The prefix position must still come from one capture for both rows."""
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    prefix = [10, 20, 30]
+    rows = [prefix + [40], prefix + [50]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+        activation_positions=[[2, -1], [2, -1]],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    # Two forwards are unavoidable (the suffix differs), but only three hidden rows are encoded:
+    # the shared prefix position once, plus one candidate position per row.
+    assert captured["tokens"] == rows
+    assert sae.encode_shapes == [(3, 3)]
+    assert [result.activation_positions for result in results] == [[2, 3], [2, 3]]
+    # Feature 1 is the fake capture's row index + 1: position 2 is read from capture 0 for both
+    # rows, while each row's own candidate position comes from its own capture.
+    assert _active_pairs(results[0], "1") == [[2, 1.0], [3, 1.0]]
+    assert _active_pairs(results[1], "1") == [[2, 1.0], [3, 2.0]]
+    assert results[0].active_features is not None and results[1].active_features is not None
+    assert [pair for pair in results[0].active_features["0"] if pair[0] == 2] == [
+        pair for pair in results[1].active_features["0"] if pair[0] == 2
+    ]
+
+
+def test_causal_prefix_owner_is_the_earliest_row_that_contains_it(monkeypatch: pytest.MonkeyPatch):
+    _captured, _sae = _patch_runtime(monkeypatch, return_sae=True)
+    rows = [[10, 20, 30, 40], [10, 20, 30, 50], [10, 25, 30, 60]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+        activation_positions=[[0, 2, 3], [0, 2, 3], [0, 2, 3]],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    # Row 2 shares only token 0 with the others; rows 0 and 1 share through position 2.
+    assert _active_pairs(results[0], "1") == [[0, 1.0], [2, 1.0], [3, 1.0]]
+    assert _active_pairs(results[1], "1") == [[0, 1.0], [2, 1.0], [3, 2.0]]
+    assert _active_pairs(results[2], "1") == [[0, 1.0], [2, 3.0], [3, 3.0]]
+
+
+def test_causal_owner_helper_is_consistent_across_rows():
+    captures = [(1, 2, 3, 4), (1, 2, 3, 5), (1, 2), (1, 9, 3, 4), (1, 2, 3, 5, 6)]
+    owners = source_endpoint._causal_owner_by_position(captures)
+    assert owners == [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0], [0, 3, 3, 3], [0, 0, 0, 1, 4]]
+    # Any two rows agreeing through a position agree on who owns it.
+    for left_index, left in enumerate(captures):
+        for right_index, right in enumerate(captures):
+            shared = source_endpoint._common_prefix_length(left, right)
+            assert owners[left_index][:shared] == owners[right_index][:shared]
+
+
+def test_all_position_mode_reads_shared_prefix_from_one_capture(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    rows = [[10, 20, 30], [10, 20, 40]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == rows
+    assert sae.encode_shapes == [(1, 3, 3), (1, 3, 3)]
+    assert _active_pairs(results[0], "1") == [[0, 1.0], [1, 1.0], [2, 1.0]]
+    assert _active_pairs(results[1], "1") == [[0, 1.0], [1, 1.0], [2, 2.0]]
+    assert _active_pairs(results[1], "0") == [[0, 1.0], [1, 2.0], [2, 3.0]]
+
+
+def test_sparse_all_positions_swaps_borrowed_rows_and_keeps_nonzero_order():
+    import numpy as np
+
+    owner = np.array([[1.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 7.0, 0.0]])
+    own = np.array([[9.0, 9.0, 9.0], [0.0, 2.0, 0.0], [3.0, 0.0, 0.0]])
+    encoded = [owner, own]
+
+    # Position 0 comes from the owner row, positions 1 and 2 stay the row's own values.
+    tokens, features, values = source_endpoint._sparse_all_positions(encoded, 1, [0, 1, 1])
+    assert tokens.tolist() == [0, 0, 1, 2]
+    assert features.tolist() == [0, 2, 1, 0]
+    assert values.tolist() == [1.0, 5.0, 2.0, 3.0]
+
+    # Nothing borrowed: identical to a plain nonzero over the row's own array.
+    tokens, features, values = source_endpoint._sparse_all_positions(encoded, 1, [1, 1, 1])
+    expected_tokens, expected_features = np.nonzero(own)
+    assert tokens.tolist() == expected_tokens.tolist()
+    assert features.tolist() == expected_features.tolist()
+    assert values.tolist() == own[expected_tokens, expected_features].tolist()
+
+
+def test_multiple_selected_positions_reuse_capture_and_sae_rows(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    rows = [[10, 20, 30, 40], [10, 20, 30, 50]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+        activation_positions=[[2, 0], [2, 0]],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [[10, 20, 30]]
+    assert captured["lengths"] == [3]
+    assert sae.encode_shapes == [(2, 3)]
+    assert [result.activation_positions for result in results] == [[2, 0], [2, 0]]
+    assert [_active_pairs(result) for result in results] == [
+        [[2, 3.0], [0, 1.0]],
+        [[2, 3.0], [0, 1.0]],
+    ]
+
+
+def test_different_required_prefixes_remain_distinct(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=[[10, 21, 30], [10, 22, 40]],
+        activation_positions=[[1], [1]],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [[10, 21], [10, 22]]
+    assert captured["lengths"] == [2, 2]
+    assert sae.encode_shapes == [(2, 3)]
+    assert _active_pairs(results[0], "1") == [[1, 1.0]]
+    assert _active_pairs(results[1], "1") == [[1, 2.0]]
+
+
+def test_same_start_with_different_capture_ends_remains_distinct(monkeypatch: pytest.MonkeyPatch):
+    captured = _patch_runtime(monkeypatch)
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=[[10, 20, 30, 40], [10, 20, 30, 50]],
+        activation_positions=[[1], [2]],
+    )
+
+    asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [[10, 20, 0], [10, 20, 30]]
+    assert captured["lengths"] == [2, 3]
+
+
+def test_all_position_mode_deduplicates_complete_rows(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    rows = [[10, 20], [10, 20], [10, 30]]
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompt_token_ids=rows,
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [[10, 20], [10, 30]]
+    assert captured["lengths"] == [2, 2]
+    assert sae.encode_shapes == [(1, 2, 3), (1, 2, 3)]
+    assert results[0].active_features == results[1].active_features
+    assert results[0].active_features is not results[1].active_features
+    assert results[0].active_features != results[2].active_features
+
+
+def test_all_position_dedup_keeps_legacy_bos_filtering_per_row(monkeypatch: pytest.MonkeyPatch):
+    captured, sae = _patch_runtime(monkeypatch, return_sae=True)
+    request = ActivationSourceRequest(
+        model="gemma-3-4b-it",
+        source="22-gemmascope-2-res-16k",
+        prompts=["same", "same"],
+    )
+
+    results = asyncio.run(
+        source_endpoint.ActivationProcessor().process_activations_batch(
+            request, source_endpoint._prepare_inputs(request)
+        )
+    )
+
+    assert captured["tokens"] == [[1, 10, 20]]
+    assert sae.encode_shapes == [(1, 3, 3)]
+    assert results[0].active_features == results[1].active_features
+    assert all(position != 0 for pairs in (results[0].active_features or {}).values() for position, _value in pairs)
 
 
 def test_legacy_path_keeps_per_sequence_encode_shape(monkeypatch: pytest.MonkeyPatch):
