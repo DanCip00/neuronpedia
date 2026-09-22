@@ -70,6 +70,21 @@ server needs a shared secret, export `NEURONPEDIA_SECRET` (or `SECRET`) and the 
 
 Startup on this machine takes about 90 s when the model weights are in the HF cache.
 
+### How many requests at once
+
+`--max-concurrent-requests N` (default 64) sets the server's `MAX_CONCURRENT_REQUESTS`: how many
+requests it admits to the model at once, which is the batch vLLM sees. The server's own default is
+8, a memory-conservative cap from before requests were costed individually, and on this workload it
+is the bottleneck: steering keeps vLLM in eager mode (`/v1/steer/source` refuses the CUDA-graph
+backend, since the SAE hook lives in the Python forward), so every decode step launches all 64
+layers' kernels from one Python thread at a near-constant cost whether it advances 8 sequences or
+64. At 8, the `VLLM::EngineCore` thread sits at 100 % of one core while the GPU runs at ~30 %, and a
+client sending 32 requests has 24 of them waiting in the server's semaphore. Match the value to the
+client's worker count; memory is not the constraint (vLLM has KV room for ~54 concurrent 8k-token
+sequences, and steer requests are a few hundred tokens). The value is reported in the ready JSON and
+in the log banner, and the server confirms it with `[LIMITER] configured concurrent=True
+max_concurrent=N`.
+
 ### Logs
 
 The log file is appended to, not truncated, with a banner per start, so a sweep that restarts the

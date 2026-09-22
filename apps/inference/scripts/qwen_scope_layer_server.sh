@@ -11,6 +11,15 @@ DEFAULT_CUDA_DEVICES="auto"
 DEFAULT_TOKEN_LIMIT="8192"
 DEFAULT_ACTIVATION_BATCH_SIZE="8"
 DEFAULT_VLLM_GPU_MEMORY_UTILIZATION="0.70"
+# Requests admitted to the model at once (the server's MAX_CONCURRENT_REQUESTS). The server's
+# own default is 8, a memory-conservative cap from before requests were costed individually.
+# Steering keeps vLLM in eager mode -- /v1/steer/source refuses the CUDA-graph backend -- so
+# every decode step pays a near-constant Python launch cost for all 64 layers whether it
+# advances 8 sequences or 64. At 8 the engine thread sits at 100% of one core with the GPU at
+# ~30%; a sweep client with N workers therefore needs the server to admit N, or 24 of its 32
+# requests wait in the semaphore and the batch the GPU sees is 8. KV is not the constraint:
+# vLLM has room for ~54 concurrent 8k-token sequences and steer requests are a few hundred.
+DEFAULT_MAX_CONCURRENT_REQUESTS="64"
 DEFAULT_TIMEOUT_SECONDS="1800"
 DEFAULT_STOP_TIMEOUT_SECONDS="60"
 DEFAULT_PROBE_TIMEOUT_SECONDS="300"
@@ -43,6 +52,10 @@ Common start options:
   --token-limit N                   Inference token limit. Default: ${DEFAULT_TOKEN_LIMIT}
   --activation-batch-size N         Activation batch size. Default: ${DEFAULT_ACTIVATION_BATCH_SIZE}
   --vllm-gpu-memory-utilization F   vLLM GPU memory fraction. Default: ${DEFAULT_VLLM_GPU_MEMORY_UTILIZATION}
+  --max-concurrent-requests N       Requests the server admits to the model at once
+                                    (MAX_CONCURRENT_REQUESTS). Match the client's worker count;
+                                    the server's own default of 8 leaves the GPU ~70% idle.
+                                    Default: ${DEFAULT_MAX_CONCURRENT_REQUESTS}
   --timeout-seconds N               Startup readiness timeout. Default: ${DEFAULT_TIMEOUT_SECONDS}
   --probe-timeout-seconds N         Timeout for the post-startup SAE probe request. Default: ${DEFAULT_PROBE_TIMEOUT_SECONDS}
   --no-probe                        Skip the /v1/activation/source probe after /health is ready.
@@ -380,6 +393,7 @@ cmd_start() {
   local token_limit="$DEFAULT_TOKEN_LIMIT"
   local activation_batch_size="$DEFAULT_ACTIVATION_BATCH_SIZE"
   local vllm_gpu_memory_utilization="$DEFAULT_VLLM_GPU_MEMORY_UTILIZATION"
+  local max_concurrent_requests="$DEFAULT_MAX_CONCURRENT_REQUESTS"
   local timeout_seconds="$DEFAULT_TIMEOUT_SECONDS"
   local probe_timeout_seconds="$DEFAULT_PROBE_TIMEOUT_SECONDS"
   local probe=1
@@ -397,6 +411,7 @@ cmd_start() {
       --token-limit) token_limit="${2:-}"; shift 2 ;;
       --activation-batch-size) activation_batch_size="${2:-}"; shift 2 ;;
       --vllm-gpu-memory-utilization) vllm_gpu_memory_utilization="${2:-}"; shift 2 ;;
+      --max-concurrent-requests) max_concurrent_requests="${2:-}"; shift 2 ;;
       --timeout-seconds) timeout_seconds="${2:-}"; shift 2 ;;
       --probe-timeout-seconds) probe_timeout_seconds="${2:-}"; shift 2 ;;
       --no-probe) probe=0; shift ;;
@@ -412,6 +427,7 @@ cmd_start() {
   validate_port "$port"
   validate_positive_int "--token-limit" "$token_limit"
   validate_positive_int "--activation-batch-size" "$activation_batch_size"
+  validate_positive_int "--max-concurrent-requests" "$max_concurrent_requests"
   validate_positive_int "--timeout-seconds" "$timeout_seconds"
   validate_positive_int "--probe-timeout-seconds" "$probe_timeout_seconds"
   validate_fraction "--vllm-gpu-memory-utilization" "$vllm_gpu_memory_utilization"
@@ -443,7 +459,7 @@ cmd_start() {
   # Append rather than truncate: a sweep that restarts the same layer after a failure
   # would otherwise destroy the evidence of what went wrong the first time.
   {
-    echo "===== ${SCRIPT_NAME} start ${source} port=${port} cuda=${cuda_devices} at $(date -u +"%Y-%m-%dT%H:%M:%SZ") ====="
+    echo "===== ${SCRIPT_NAME} start ${source} port=${port} cuda=${cuda_devices} max_concurrent_requests=${max_concurrent_requests} at $(date -u +"%Y-%m-%dT%H:%M:%SZ") ====="
   } >>"$log_file"
 
   (
@@ -451,6 +467,7 @@ cmd_start() {
     export CUDA_VISIBLE_DEVICES="$cuda_devices"
     export SAE_SETS="[]"
     export SAELENS_RELEASE="[\"${SAELENS_RELEASE}\"]"
+    export MAX_CONCURRENT_REQUESTS="$max_concurrent_requests"
     exec setsid uv run python start.py \
       --host "$host" \
       --port "$port" \
@@ -527,7 +544,7 @@ cmd_start() {
     fi
   fi
 
-  printf '{"status":"ready","pid":%s,"pgid":%s,"source":"%s","source_set":"%s","model":"%s","base_url":"%s","cuda_devices":"%s","pidfile":"%s","log":"%s","probed":%s,"stop_command":"%s stop --pidfile %s"}\n' \
+  printf '{"status":"ready","pid":%s,"pgid":%s,"source":"%s","source_set":"%s","model":"%s","base_url":"%s","cuda_devices":"%s","max_concurrent_requests":%s,"pidfile":"%s","log":"%s","probed":%s,"stop_command":"%s stop --pidfile %s"}\n' \
     "$PID" \
     "$PGID" \
     "$(json_escape "$source")" \
@@ -535,6 +552,7 @@ cmd_start() {
     "$(json_escape "$MODEL_ID")" \
     "$(json_escape "$base_url")" \
     "$(json_escape "$cuda_devices")" \
+    "$max_concurrent_requests" \
     "$(json_escape "$pidfile")" \
     "$(json_escape "$log_file")" \
     "$([[ $probe -eq 1 ]] && echo true || echo false)" \
