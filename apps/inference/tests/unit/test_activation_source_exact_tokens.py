@@ -630,7 +630,7 @@ def test_sparse_all_positions_swaps_borrowed_rows_and_keeps_nonzero_order():
 
     owner = np.array([[1.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 7.0, 0.0]])
     own = np.array([[9.0, 9.0, 9.0], [0.0, 2.0, 0.0], [3.0, 0.0, 0.0]])
-    encoded = [owner, own]
+    encoded = [source_endpoint._sparse_rows(torch.tensor(owner)), source_endpoint._sparse_rows(torch.tensor(own))]
 
     # Position 0 comes from the owner row, positions 1 and 2 stay the row's own values.
     tokens, features, values = source_endpoint._sparse_all_positions(encoded, 1, [0, 1, 1])
@@ -644,6 +644,23 @@ def test_sparse_all_positions_swaps_borrowed_rows_and_keeps_nonzero_order():
     assert tokens.tolist() == expected_tokens.tolist()
     assert features.tolist() == expected_features.tolist()
     assert values.tolist() == own[expected_tokens, expected_features].tolist()
+
+
+def test_group_by_feature_matches_per_triple_dict_building():
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    tokens = np.repeat(np.arange(40), 5)
+    features = rng.integers(0, 12, size=tokens.shape)
+    values = rng.random(tokens.shape, dtype=np.float32) * 10
+    expected: dict[str, list[list[float]]] = {}
+    for token_idx, feature_idx, value in zip(tokens, features, values, strict=True):
+        expected.setdefault(str(int(feature_idx)), []).append(
+            [int(token_idx), round(float(value), source_endpoint.ROUND_DECIMALS)]
+        )
+
+    assert source_endpoint._group_by_feature(tokens, features, values) == expected
+    assert source_endpoint._group_by_feature(tokens[:0], features[:0], values[:0]) == {}
 
 
 def test_multiple_selected_positions_reuse_capture_and_sae_rows(monkeypatch: pytest.MonkeyPatch):

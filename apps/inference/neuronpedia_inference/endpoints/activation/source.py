@@ -378,37 +378,90 @@ def _causal_owner_by_position(capture_tokens: list[tuple[int, ...]]) -> list[lis
     return owners
 
 
+@dataclass(frozen=True)
+class _SparseRows:
+    """Nonzero ``(position, feature, value)`` triples of one encoded ``[seq, d_sae]`` row block.
+
+    Sorted by ``(position, feature)``, the order ``torch.nonzero`` yields on a row-major tensor.
+    """
+
+    positions: np.ndarray
+    features: np.ndarray
+    values: np.ndarray
+
+
+def _sparse_rows(encoded: torch.Tensor) -> _SparseRows:
+    """Nonzero triples of a ``[seq, d_sae]`` encoding, found on the tensor's own device.
+
+    A TopK SAE leaves ~50 nonzeros per token, so for an 80k-feature SAE the dense
+    ``[1536, 80k]`` block is 490 MB of which 0.06% matters. Moving it to the host and
+    running ``np.nonzero`` there cost ~0.5 s of event-loop time per request; ``nonzero`` on
+    the device and a gather cost ~10 ms and move three small arrays instead.
+    """
+    with torch.no_grad():
+        positions, features = encoded.nonzero(as_tuple=True)
+        values = encoded[positions, features].float()
+    return _SparseRows(
+        positions=positions.cpu().numpy(),
+        features=features.cpu().numpy(),
+        values=values.cpu().numpy(),
+    )
+
+
 def _sparse_all_positions(
-    encoded_by_capture: list[np.ndarray], capture_index: int, owners: list[int]
+    sparse_by_capture: list[_SparseRows], capture_index: int, owners: list[int]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Nonzero ``(position, feature, value)`` triples for one row, honouring position owners.
 
     Positions owned by another capture row (typically just a shared BOS or chat header) are
-    swapped in individually rather than by rebuilding the whole ``[seq, d_sae]`` array, which
-    for an 80k-feature SAE is a ~130 MB copy per 400-token row. Output is sorted by
-    ``(position, feature)``, the same order ``np.nonzero`` yields on an unshared row.
+    swapped in individually from that row's triples. Output is sorted by
+    ``(position, feature)``, the same order a plain ``nonzero`` yields on an unshared row.
     """
-    own = encoded_by_capture[capture_index]
-    token_indices, feature_indices = np.nonzero(own)
+    own = sparse_by_capture[capture_index]
     borrowed = [position for position, owner in enumerate(owners) if owner != capture_index]
     if not borrowed:
-        return token_indices, feature_indices, own[token_indices, feature_indices]
+        return own.positions, own.features, own.values
 
-    keep = ~np.isin(token_indices, borrowed)
-    tokens = [token_indices[keep]]
-    features = [feature_indices[keep]]
-    values = [own[tokens[0], features[0]]]
+    keep = ~np.isin(own.positions, borrowed)
+    tokens = [own.positions[keep]]
+    features = [own.features[keep]]
+    values = [own.values[keep]]
     for position in borrowed:
-        owner_row = encoded_by_capture[owners[position]][position]
-        active = np.nonzero(owner_row)[0]
-        tokens.append(np.full(active.shape, position, dtype=token_indices.dtype))
-        features.append(active)
-        values.append(owner_row[active])
+        owner = sparse_by_capture[owners[position]]
+        active = owner.positions == position
+        tokens.append(owner.positions[active])
+        features.append(owner.features[active])
+        values.append(owner.values[active])
     token_indices = np.concatenate(tokens)
     feature_indices = np.concatenate(features)
     activation_values = np.concatenate(values)
     order = np.lexsort((feature_indices, token_indices))
     return token_indices[order], feature_indices[order], activation_values[order]
+
+
+def _group_by_feature(
+    token_indices: np.ndarray, feature_indices: np.ndarray, activation_values: np.ndarray
+) -> dict[str, list[list[float]]]:
+    """``activeFeatures`` layout: feature id -> ``[position, value]`` pairs in position order.
+
+    One stable sort by feature and a split at the feature boundaries, instead of a Python
+    loop appending each triple to a dict entry; the loop cost ~0.2 s per 1536-token row.
+    Values are rounded in float64 so the result matches ``round(float(v), ROUND_DECIMALS)``.
+    """
+    if len(feature_indices) == 0:
+        return {}
+    order = np.argsort(feature_indices, kind="stable")
+    sorted_features = feature_indices[order]
+    positions = token_indices[order].tolist()
+    values = np.round(activation_values[order].astype(np.float64), ROUND_DECIMALS).tolist()
+    unique_features, starts = np.unique(sorted_features, return_index=True)
+    ends = [*starts[1:].tolist(), len(sorted_features)]
+    return {
+        str(int(feature)): [
+            [position, value] for position, value in zip(positions[start:end], values[start:end], strict=True)
+        ]
+        for feature, start, end in zip(unique_features.tolist(), starts.tolist(), ends, strict=True)
+    }
 
 
 def _prepare_inputs(request: ActivationSourceRequest) -> list[_PreparedInput]:
@@ -556,25 +609,24 @@ class ActivationProcessor:
         owners_by_capture = _causal_owner_by_position(unique_capture_tokens)
         results: list[ActivationSourceResult] = []
         if selected_positions_by_input is None:
-            encoded_by_capture: list[np.ndarray] = []
+            sparse_by_capture: list[_SparseRows] = []
             for capture_index, seq_len in enumerate(original_lengths):
                 with torch.no_grad():
                     activation_data = cache[hook_name][capture_index : capture_index + 1, :seq_len].to(config.device)
-                    encoded_by_capture.append(sae.encode(activation_data)[0].float().cpu().numpy())
+                    sparse_by_capture.append(_sparse_rows(sae.encode(activation_data)[0]))
             for input_index, row in enumerate(prepared):
                 capture_index = capture_index_by_input[input_index]
                 token_indices, feature_indices, activation_values = _sparse_all_positions(
-                    encoded_by_capture, capture_index, owners_by_capture[capture_index]
+                    sparse_by_capture, capture_index, owners_by_capture[capture_index]
                 )
-                active_features: dict[str, list[list[float]]] = {}
-                for token_idx, feature_idx, activation_value in zip(
-                    token_indices, feature_indices, activation_values, strict=True
-                ):
-                    if row.legacy_compat and token_idx == 0:
-                        continue
-                    active_features.setdefault(str(int(feature_idx)), []).append(
-                        [int(token_idx), round(float(activation_value), ROUND_DECIMALS)]
+                if row.legacy_compat:
+                    keep = token_indices != 0
+                    token_indices, feature_indices, activation_values = (
+                        token_indices[keep],
+                        feature_indices[keep],
+                        activation_values[keep],
                     )
+                active_features = _group_by_feature(token_indices, feature_indices, activation_values)
                 results.append(
                     ActivationSourceResult(
                         tokens=row.tokens,
