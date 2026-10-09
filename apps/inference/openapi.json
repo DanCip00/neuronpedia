@@ -2537,14 +2537,65 @@
       "SourceSteerFeature": {
         "description": "One explicitly selected SAE feature intervention.",
         "properties": {
+          "activationThreshold": {
+            "default": 0.0,
+            "description": "Minimum pre-edit feature activation; zero preserves the positive-activation gate",
+            "minimum": 0.0,
+            "title": "Activationthreshold",
+            "type": "number"
+          },
+          "cooldownMode": {
+            "default": "fixed",
+            "enum": [
+              "fixed",
+              "feature_inactive"
+            ],
+            "title": "Cooldownmode",
+            "type": "string"
+          },
+          "cooldownTokens": {
+            "default": 0,
+            "description": "Skip N prediction rows after each pulse; zero allows each active row",
+            "minimum": 0.0,
+            "title": "Cooldowntokens",
+            "type": "integer"
+          },
           "featureIndex": {
             "description": "Feature index in the loaded SAE",
             "minimum": 0.0,
             "title": "Featureindex",
             "type": "integer"
           },
+          "gateFeatureIndices": {
+            "description": "Detector-only SAE helpers, all required to have positive pre-edit activation",
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 16,
+            "title": "Gatefeatureindices",
+            "type": "array"
+          },
+          "magnitudeMode": {
+            "default": "activation",
+            "enum": [
+              "activation",
+              "norm_relative"
+            ],
+            "title": "Magnitudemode",
+            "type": "string"
+          },
           "operation": {
             "$ref": "#/components/schemas/SAEInterventionOperation"
+          },
+          "thresholdMode": {
+            "default": "activation",
+            "description": "Threshold raw activation or activation divided by the pre-edit residual norm",
+            "enum": [
+              "activation",
+              "residual_relative"
+            ],
+            "title": "Thresholdmode",
+            "type": "string"
           },
           "value": {
             "anyOf": [
@@ -2600,11 +2651,28 @@
             "title": "Featureactivations",
             "type": "object"
           },
+          "featureEditSteps": {
+            "additionalProperties": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Featureeditsteps",
+            "type": "object"
+          },
           "perturbationNorms": {
             "items": {
               "type": "number"
             },
             "title": "Perturbationnorms",
+            "type": "array"
+          },
+          "residualNorms": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Residualnorms",
             "type": "array"
           }
         },
@@ -2952,6 +3020,199 @@
           "positionPolicy"
         ],
         "title": "SourceSteeringSpec",
+        "type": "object"
+      },
+      "SourceWindowScoreArm": {
+        "additionalProperties": false,
+        "description": "One distribution comparison, indexed by input prediction position.",
+        "properties": {
+          "arm": {
+            "enum": [
+              "feature_inactive",
+              "single_pulse",
+              "baseline_repeat"
+            ],
+            "title": "Arm",
+            "type": "string"
+          },
+          "featureActivations": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Featureactivations",
+            "type": "array"
+          },
+          "gateFeatureActivations": {
+            "additionalProperties": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Gatefeatureactivations",
+            "type": "object"
+          },
+          "kl": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Kl",
+            "type": "array"
+          },
+          "perturbationNorms": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Perturbationnorms",
+            "type": "array"
+          },
+          "pulsePositions": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Pulsepositions",
+            "type": "array"
+          },
+          "residualNorms": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Residualnorms",
+            "type": "array"
+          },
+          "top1Agree": {
+            "items": {
+              "type": "boolean"
+            },
+            "title": "Top1Agree",
+            "type": "array"
+          }
+        },
+        "required": [
+          "arm",
+          "kl",
+          "top1Agree",
+          "featureActivations",
+          "residualNorms",
+          "perturbationNorms",
+          "pulsePositions"
+        ],
+        "title": "SourceWindowScoreArm",
+        "type": "object"
+      },
+      "SourceWindowScoreRequest": {
+        "additionalProperties": false,
+        "description": "Plain token window; steering follows actual activation throughout it.",
+        "properties": {
+          "failIfBusy": {
+            "default": false,
+            "title": "Failifbusy",
+            "type": "boolean"
+          },
+          "includeBaselineRepeat": {
+            "default": true,
+            "title": "Includebaselinerepeat",
+            "type": "boolean"
+          },
+          "includeSinglePulse": {
+            "default": true,
+            "title": "Includesinglepulse",
+            "type": "boolean"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "steering": {
+            "$ref": "#/components/schemas/SourceSteeringSpec"
+          },
+          "tokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 512,
+            "minItems": 2,
+            "title": "Tokenids",
+            "type": "array"
+          },
+          "traceFeatureIndices": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 1024,
+            "title": "Tracefeatureindices",
+            "type": "array"
+          }
+        },
+        "required": [
+          "model",
+          "tokenIds",
+          "steering"
+        ],
+        "title": "SourceWindowScoreRequest",
+        "type": "object"
+      },
+      "SourceWindowScoreResponse": {
+        "additionalProperties": false,
+        "description": "Position t predicts provided token t+1; the last input row is excluded.",
+        "properties": {
+          "arms": {
+            "items": {
+              "$ref": "#/components/schemas/SourceWindowScoreArm"
+            },
+            "title": "Arms",
+            "type": "array"
+          },
+          "baselineFeatureActivations": {
+            "additionalProperties": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Baselinefeatureactivations",
+            "type": "object"
+          },
+          "baselineResidualNorms": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Baselineresidualnorms",
+            "type": "array"
+          },
+          "klMethod": {
+            "const": "full_vocabulary_forward_float32",
+            "default": "full_vocabulary_forward_float32",
+            "title": "Klmethod",
+            "type": "string"
+          },
+          "modelInputTokenIds": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Modelinputtokenids",
+            "type": "array"
+          },
+          "predictionPositions": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Predictionpositions",
+            "type": "array"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/SourceSteerResolvedMetadata"
+          }
+        },
+        "required": [
+          "modelInputTokenIds",
+          "predictionPositions",
+          "resolved",
+          "baselineFeatureActivations",
+          "baselineResidualNorms",
+          "arms"
+        ],
+        "title": "SourceWindowScoreResponse",
         "type": "object"
       },
       "SteerCompletionChatRequest": {
@@ -4517,6 +4778,45 @@
           }
         },
         "summary": "Steer Source"
+      }
+    },
+    "/v1/steer/source/window": {
+      "post": {
+        "description": "Compare paired causal forwards; never regenerate or alter provided tokens.",
+        "operationId": "steerSourceWindowPost",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceWindowScoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceWindowScoreResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Score Source Window"
       }
     },
     "/v1/tokenize": {

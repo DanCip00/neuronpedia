@@ -83,3 +83,7 @@ export const STEER_METHOD_LABELS: Record<NPSteerMethod, string> = {
   ORTHOGONAL_DECOMP: 'Orthogonal Decomp',
   PROJECTION_CAP: 'Projection Cap',
 };
+
+export type SourceWindowScoreRequest = Schemas['SourceWindowScoreRequest'];
+export type SourceWindowScoreResponse = Schemas['SourceWindowScoreResponse'];
+export type SourceWindowScoreArm = Schemas['SourceWindowScoreArm'];

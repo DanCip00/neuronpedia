@@ -220,7 +220,7 @@ def test_recompute_after_preemption_restarts_position_tracking() -> None:
     # A multi-row forward after decoding began is vLLM recomputing the preempted prompt: the
     # final prompt row must be edited again, or the steering would silently vanish.
     torch.testing.assert_close(modifier(torch.zeros(3, 3)), edited_last)
-    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(2, 1), (2, 1)]
+    assert [(entry["row_offset"], entry["num_rows"]) for entry in diagnostics] == [(2, 1)]
 
 
 def test_modifier_delta_changes_downstream_logits_but_capture_clone_does_not() -> None:
@@ -287,3 +287,92 @@ def test_unregister_drops_the_request_but_keeps_the_sae_resident(monkeypatch) ->
     assert sae_ref() is not None, "the SAE must stay resident for the next request"
     make()
     assert loads == [("toy-release", "layer0", "cpu", "float32")], "second request must not reload the SAE"
+
+
+def _pulse_spec(n: int = 2, mode: str = "fixed") -> dict:
+    spec = _spec("each_generated_token", "scale", 0.25)
+    spec["features"][0].update(magnitude_mode="norm_relative", cooldown_tokens=n, cooldown_mode=mode)
+    return spec
+
+
+def test_pulse_triggers_late_and_skips_exactly_n_positions(monkeypatch) -> None:
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._load_worker_sae", lambda *_args: WorkerTinySAE())
+    diagnostics: list[dict] = []
+    modifier = _make_sae_modifier(
+        _pulse_spec(), dev=torch.device("cpu"), dt=torch.float32, prompt_len=3, diag_store=diagnostics
+    )
+    # Prompt is silent. Trigger on the second generated prediction row instead.
+    assert modifier(torch.tensor([[0.0, 9.0, 0.0], [0.0, 9.0, 0.0], [3.0, 0.0, 4.0]])).count_nonzero() == 0
+    assert modifier(torch.tensor([[3.0, 0.0, 4.0]])).count_nonzero() == 0
+    row = torch.tensor([[3.0, 4.0, 0.0]])
+    expected = torch.tensor([[0.0, 1.25, 0.0]])
+    torch.testing.assert_close(modifier(row), expected)  # position 4
+    torch.testing.assert_close(modifier(row), torch.zeros_like(row))  # position 5
+    torch.testing.assert_close(modifier(row), torch.zeros_like(row))  # position 6
+    torch.testing.assert_close(modifier(row), expected)  # position 7
+    assert [pos for d in diagnostics for pos in d["feature_edit_steps"]["1"]] == [4, 7]
+    assert sum(d["edit_count"] for d in diagnostics) == 2
+
+
+def test_feature_inactive_rearms_only_after_zero_and_is_request_local(monkeypatch) -> None:
+    sae = WorkerTinySAE()
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._load_worker_sae", lambda *_args: sae)
+
+    def make():
+        return _make_sae_modifier(
+            _pulse_spec(0, "feature_inactive"), dev=torch.device("cpu"), dt=torch.float32, prompt_len=1, diag_store=[]
+        )
+
+    first, second = make(), make()
+    active = torch.tensor([[3.0, 4.0, 0.0]])
+    silent = torch.tensor([[3.0, 0.0, 4.0]])
+    expected = torch.tensor([[0.0, 1.25, 0.0]])
+    torch.testing.assert_close(first(active), expected)
+    torch.testing.assert_close(first(active), torch.zeros_like(active))
+    torch.testing.assert_close(second(active), expected)
+    torch.testing.assert_close(first(silent), torch.zeros_like(silent))
+    torch.testing.assert_close(first(active), expected)
+
+
+def test_pulse_recompute_replays_original_schedule_and_deduplicates_diagnostics(monkeypatch) -> None:
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._load_worker_sae", lambda *_args: WorkerTinySAE())
+    diagnostics: list[dict] = []
+    modifier = _make_sae_modifier(
+        _pulse_spec(), dev=torch.device("cpu"), dt=torch.float32, prompt_len=3, diag_store=diagnostics
+    )
+    prompt = torch.tensor([[0.0, 4.0, 0.0], [0.0, 4.0, 0.0], [3.0, 4.0, 0.0]])
+    initial = modifier(prompt)
+    row = prompt[-1:]
+    for _ in range(3):
+        modifier(row)
+    replay = modifier(torch.cat([prompt, row, row, row]))
+    torch.testing.assert_close(replay[:3], initial)
+    torch.testing.assert_close(replay[3:5], torch.zeros(2, 3))
+    torch.testing.assert_close(replay[5:], initial[-1:])
+    assert sum(d["edit_count"] for d in diagnostics) == 2
+    assert [pos for d in diagnostics for pos in d["feature_edit_steps"]["1"]] == [2, 5]
+
+
+def test_v7_gate_waits_across_decode_and_replays_without_helper_edits(monkeypatch) -> None:
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._load_worker_sae", lambda *_args: WorkerTinySAE())
+    diagnostics: list[dict] = []
+    spec = _pulse_spec(0, "feature_inactive")
+    spec["features"][0].update(activation_threshold=2.0, gate_feature_indices=[0])
+    modifier = _make_sae_modifier(spec, dev=torch.device("cpu"), dt=torch.float32, prompt_len=3, diag_store=diagnostics)
+    prompt = torch.tensor([[9.0, 9.0, 0.0], [9.0, 9.0, 0.0], [1.0, 1.0, 0.0]])
+    modifier(prompt[:2])
+    assert torch.count_nonzero(modifier(prompt[2:])) == 0
+    missing = torch.tensor([[0.0, 2.0, 0.0]])
+    accepted = torch.tensor([[1.0, 2.0, 0.0]])
+    assert torch.count_nonzero(modifier(missing)) == 0
+    first = modifier(accepted)
+    assert torch.count_nonzero(first[:, [0, 2]]) == 0
+    assert first[0, 1] > 0
+    assert torch.count_nonzero(modifier(missing)) == 0
+    assert torch.count_nonzero(modifier(accepted)) == 0
+    replay = modifier(torch.cat([prompt, missing, accepted, missing, accepted]))
+    torch.testing.assert_close(replay[4:5], first)
+    assert [p for d in diagnostics for p in d["feature_edit_steps"]["1"]] == [4]
+    assert sum(d["edit_count"] for d in diagnostics) == 1
+    assert all(set(d["feature_activations"]) == {"0", "1"} for d in diagnostics)
+    assert sum(len(d["residual_norms"]) for d in diagnostics) == 5

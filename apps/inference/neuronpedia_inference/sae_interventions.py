@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from typing import Literal
 
@@ -17,6 +17,47 @@ class SAEFeatureIntervention:
     feature_index: int
     operation: InterventionOperation
     value: float | None = None
+    magnitude_mode: Literal["activation", "norm_relative"] = "activation"
+    cooldown_tokens: int = 0
+    cooldown_mode: Literal["fixed", "feature_inactive"] = "fixed"
+    activation_threshold: float = 0.0
+    threshold_mode: Literal["activation", "residual_relative"] = "activation"
+    gate_feature_indices: tuple[int, ...] = ()
+
+    @property
+    def pulsed(self) -> bool:
+        return (
+            self.magnitude_mode == "norm_relative"
+            or self.cooldown_tokens > 0
+            or self.cooldown_mode == "feature_inactive"
+        )
+
+
+@dataclass
+class PulseState:
+    """One request's per-feature refractory state, never shared with the SAE cache."""
+
+    last_pulse: dict[int, int] = field(default_factory=dict)
+    blocked: set[int] = field(default_factory=set)
+
+    def allow(
+        self, feature: SAEFeatureIntervention, activation: float, position: int, detector_accepts: bool = True
+    ) -> bool:
+        """Delay within the original feature episode; detector dropout never rearms it."""
+        index = feature.feature_index
+        if activation <= 0:
+            self.blocked.discard(index)
+            return False
+        if not detector_accepts:
+            return False
+        if feature.cooldown_mode == "feature_inactive":
+            if index in self.blocked:
+                return False
+        elif position <= self.last_pulse.get(index, -feature.cooldown_tokens - 1) + feature.cooldown_tokens:
+            return False
+        self.last_pulse[index] = position
+        self.blocked.add(index)
+        return True
 
 
 @dataclass(frozen=True)
@@ -27,6 +68,8 @@ class InterventionDiagnostics:
     feature_activations: dict[int, list[float]]
     encoded: bool
     active: bool
+    feature_edit_steps: dict[int, list[int]] = field(default_factory=dict)
+    residual_norms: list[float] = field(default_factory=list)
 
 
 def validate_feature_interventions(features: list[SAEFeatureIntervention], d_sae: int | None) -> None:
@@ -41,6 +84,36 @@ def validate_feature_interventions(features: list[SAEFeatureIntervention], d_sae
             if d_sae is None:
                 raise ValueError(f"featureIndex {feature.feature_index} must be nonnegative")
             raise ValueError(f"featureIndex {feature.feature_index} is outside [0, {d_sae})")
+        if not isfinite(feature.activation_threshold) or feature.activation_threshold < 0:
+            raise ValueError("activationThreshold must be finite and nonnegative")
+        if feature.threshold_mode not in {"activation", "residual_relative"}:
+            raise ValueError("Unsupported thresholdMode")
+        helpers = feature.gate_feature_indices
+        if len(set(helpers)) != len(helpers):
+            raise ValueError("gateFeatureIndices must be unique")
+        for helper in helpers:
+            if type(helper) is not int or helper < 0 or (d_sae is not None and helper >= d_sae):
+                raise ValueError("gateFeatureIndices must contain valid nonnegative SAE feature indices")
+            if helper == feature.feature_index:
+                raise ValueError("gateFeatureIndices must not include the edited feature")
+        if feature.operation == "add" and (
+            feature.activation_threshold > 0 or helpers or feature.threshold_mode != "activation"
+        ):
+            raise ValueError("Detector gates require an activation-dependent operation")
+        if feature.magnitude_mode not in {"activation", "norm_relative"}:
+            raise ValueError("Unsupported magnitudeMode")
+        if feature.cooldown_mode not in {"fixed", "feature_inactive"}:
+            raise ValueError("Unsupported cooldownMode")
+        if type(feature.cooldown_tokens) is not int or feature.cooldown_tokens < 0:
+            raise ValueError("cooldownTokens must be a nonnegative integer")
+        if feature.cooldown_mode == "feature_inactive" and feature.cooldown_tokens != 0:
+            raise ValueError("feature_inactive cooldown must omit cooldownTokens or set it to zero")
+        if feature.operation == "add" and feature.pulsed:
+            raise ValueError("Pulse steering requires an activation-dependent operation")
+        if feature.magnitude_mode == "norm_relative" and (
+            feature.operation != "scale" or feature.value is None or not 0 < feature.value <= 1
+        ):
+            raise ValueError("norm_relative requires scale with rho in (0, 1]")
         if feature.operation == "add":
             if feature.value is None or not isfinite(float(feature.value)):
                 raise ValueError("add requires a finite value")
@@ -89,6 +162,8 @@ def sae_intervention_delta(
     *,
     return_diagnostics: bool = False,
     decoder_vectors_by_feature: Mapping[int, torch.Tensor] | None = None,
+    pulse_state: PulseState | None = None,
+    row_offset: int = 0,
 ) -> tuple[torch.Tensor, InterventionDiagnostics | None]:
     """Compute a hidden-state delta while preserving the SAE reconstruction residual."""
     if rows.dim() != 2:
@@ -103,19 +178,28 @@ def sae_intervention_delta(
         for feature in features
         if not (
             (feature.operation == "add" and float(feature.value or 0.0) == 0.0)
-            or (feature.operation == "scale" and float(feature.value or 0.0) == 1.0)
+            or (
+                feature.operation == "scale"
+                and feature.magnitude_mode == "activation"
+                and float(feature.value or 0.0) == 1.0
+            )
         )
     ]
     if not effective:
         diag = InterventionDiagnostics(0, 0, [], {}, encoded=False, active=False) if return_diagnostics else None
         return torch.zeros_like(rows), diag
 
+    if any(feature.pulsed for feature in effective) and pulse_state is None:
+        raise ValueError("Pulse steering requires request-local pulse_state")
     needs_encode = any(feature.operation in {"scale", "ablate"} for feature in effective)
     if needs_encode and sae is None:
         raise ValueError("scale and ablate require a loaded SAE encoder")
     acts = _encode(sae, rows) if needs_encode else None
     coeffs = torch.zeros((rows.shape[0], len(effective)), device=rows.device, dtype=torch.float32)
     activations_for_diag: dict[int, list[float]] = {}
+    edit_masks = torch.ones_like(coeffs, dtype=torch.bool)
+    residual_norms = rows.float().norm(dim=-1)
+
     for col, feature in enumerate(effective):
         if feature.operation == "add":
             if feature.value is None:
@@ -125,13 +209,39 @@ def sae_intervention_delta(
         assert acts is not None
         feature_acts = acts[:, feature.feature_index].to(rows.device, dtype=torch.float32)
         activations_for_diag[feature.feature_index] = [float(x) for x in feature_acts.detach().cpu()]
+        detector_mask = feature_acts > 0
+        scores = feature_acts
+        if feature.threshold_mode == "residual_relative":
+            detector_mask &= residual_norms > 0
+            scores = torch.where(residual_norms > 0, feature_acts / residual_norms.clamp_min(1e-30), 0.0)
+        detector_mask &= scores >= feature.activation_threshold
+        for helper_index in feature.gate_feature_indices:
+            helper_acts = acts[:, helper_index].to(rows.device, dtype=torch.float32)
+            activations_for_diag[helper_index] = [float(x) for x in helper_acts.detach().cpu()]
+            detector_mask &= helper_acts > 0
+        if feature.pulsed:
+            assert pulse_state is not None
+            edit_masks[:, col] = torch.tensor(
+                [
+                    pulse_state.allow(feature, float(a), row_offset + i, bool(accepts))
+                    for i, (a, accepts) in enumerate(zip(feature_acts.detach().cpu(), detector_mask.detach().cpu()))
+                ],
+                device=rows.device,
+                dtype=torch.bool,
+            )
+        elif feature.activation_threshold > 0 or feature.gate_feature_indices or feature.threshold_mode != "activation":
+            edit_masks[:, col] = detector_mask
+        if feature.magnitude_mode == "norm_relative":
+            assert feature.value is not None
+            coeffs[:, col] = float(feature.value) * residual_norms * edit_masks[:, col]
+            continue
         if feature.operation == "ablate":
             multiplier = 0.0
         else:
             if feature.value is None:
                 raise ValueError("scale requires a finite nonnegative value")
             multiplier = float(feature.value)
-        coeffs[:, col] = (multiplier - 1.0) * feature_acts
+        coeffs[:, col] = (multiplier - 1.0) * feature_acts * edit_masks[:, col]
 
     if decoder_vectors_by_feature is not None:
         try:
@@ -149,6 +259,13 @@ def sae_intervention_delta(
             f"Decoder vectors have shape {tuple(vectors.shape)} but hidden rows have width {rows.shape[-1]}"
         )
     vectors = vectors.to(rows.device, dtype=torch.float32)
+    # Normalize only residual-relative directions. Legacy edits retain native SAE units.
+    for col, feature in enumerate(effective):
+        if feature.magnitude_mode == "norm_relative":
+            norm = vectors[col].norm()
+            if not bool(torch.isfinite(norm).item()) or float(norm.item()) <= 0:
+                raise ValueError("norm_relative requires a finite nonzero decoder direction")
+            vectors[col] = vectors[col] / norm
     delta = (coeffs @ vectors).to(dtype=rows.dtype)
     if not return_diagnostics:
         return delta, None
@@ -156,9 +273,16 @@ def sae_intervention_delta(
     active = bool(torch.any(delta != 0).item())
     return delta, InterventionDiagnostics(
         edited_rows=int(rows.shape[0]),
-        edit_count=len(effective) * int(rows.shape[0]),
+        edit_count=int(edit_masks.sum().item()),
         perturbation_norms=norms,
         feature_activations=activations_for_diag,
         encoded=needs_encode,
         active=active,
+        residual_norms=residual_norms.detach().cpu().tolist(),
+        feature_edit_steps={
+            f.feature_index: [
+                row_offset + i for i, enabled in enumerate(edit_masks[:, col].detach().cpu()) if bool(enabled)
+            ]
+            for col, f in enumerate(effective)
+        },
     )

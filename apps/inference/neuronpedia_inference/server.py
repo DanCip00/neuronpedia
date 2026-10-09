@@ -78,6 +78,7 @@ from neuronpedia_inference.endpoints.steer.completion_chat import (
 from neuronpedia_inference.endpoints.steer.source import (
     router as steer_source_router,
 )
+from neuronpedia_inference.endpoints.steer.window import router as steer_window_router
 from neuronpedia_inference.endpoints.tokenize import router as tokenize_router
 from neuronpedia_inference.endpoints.util.sae_topk_by_decoder_cossim import (
     router as sae_topk_by_decoder_cossim_router,
@@ -798,6 +799,7 @@ v1_router.include_router(activation_all_batch_router)
 v1_router.include_router(steer_completion_chat_router)
 v1_router.include_router(steer_completion_router)
 v1_router.include_router(steer_source_router)
+v1_router.include_router(steer_window_router)
 v1_router.include_router(activation_single_router)
 v1_router.include_router(activation_single_batch_router)
 v1_router.include_router(activation_attention_router)

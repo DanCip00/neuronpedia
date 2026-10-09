@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from neuronpedia_inference.sae_interventions import SAEFeatureIntervention, sae_intervention_delta
+from neuronpedia_inference.sae_interventions import PulseState, SAEFeatureIntervention, sae_intervention_delta
 
 
 class TinyTopKSAE:
@@ -129,3 +130,133 @@ def test_add_uses_cached_decoder_vectors_without_an_sae() -> None:
     torch.testing.assert_close(delta, torch.tensor([[0.0, 0.0, -1.5], [0.0, 0.0, -1.5]]))
     assert diag is not None
     assert diag.encoded is False
+
+
+def test_relative_pulse_normalizes_nonunit_decoder_and_gates_on_topk() -> None:
+    sae = TinyTopKSAE()
+    rows = torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+    feature = SAEFeatureIntervention(2, "scale", 0.25, "norm_relative", 1)
+    delta, diag = sae_intervention_delta(rows, sae, [feature], pulse_state=PulseState(), return_diagnostics=True)
+    torch.testing.assert_close(delta[0].norm(), rows[0].norm() * 0.25)
+    torch.testing.assert_close(delta[1], torch.zeros(3))
+    assert diag is not None and diag.edit_count == 1 and diag.feature_edit_steps == {2: [0]}
+    silent, diag = sae_intervention_delta(
+        rows,
+        sae,
+        [SAEFeatureIntervention(1, "scale", 0.5, "norm_relative")],
+        pulse_state=PulseState(),
+        return_diagnostics=True,
+    )
+    assert silent.count_nonzero() == 0
+    assert diag is not None and diag.encoded and not diag.active and diag.edit_count == 0
+
+
+def test_multi_pulses_use_the_same_unedited_residual_and_independent_cooldowns() -> None:
+    sae = TinyTopKSAE()
+    rows = torch.tensor([[1.0, 1.0, 1.0]] * 4)
+    features = [
+        SAEFeatureIntervention(0, "scale", 0.1, "norm_relative", 1),
+        SAEFeatureIntervention(2, "scale", 0.5, "norm_relative", 2),
+    ]
+    delta, diag = sae_intervention_delta(rows, sae, features, pulse_state=PulseState(), return_diagnostics=True)
+    scale = rows[0].norm()
+    torch.testing.assert_close(
+        delta, scale * torch.tensor([[0.1, 0.0, 0.5], [0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.0, 0.5]])
+    )
+    assert diag is not None and diag.feature_edit_steps == {0: [0, 2], 2: [0, 3]}
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        SAEFeatureIntervention(0, "scale", 0.0, "norm_relative"),
+        SAEFeatureIntervention(0, "scale", 1.1, "norm_relative"),
+        SAEFeatureIntervention(0, "scale", float("nan"), "norm_relative"),
+        SAEFeatureIntervention(0, "ablate", None, "norm_relative"),
+        SAEFeatureIntervention(0, "add", 1.0, cooldown_tokens=2),
+        SAEFeatureIntervention(0, "scale", 2.0, cooldown_tokens=-1),
+        SAEFeatureIntervention(0, "scale", 2.0, cooldown_tokens=True),
+        SAEFeatureIntervention(0, "scale", 2.0, cooldown_tokens=2, cooldown_mode="feature_inactive"),
+    ],
+)
+def test_invalid_pulse_configuration_rejected(feature: SAEFeatureIntervention) -> None:
+    with pytest.raises(ValueError):
+        sae_intervention_delta(torch.ones(1, 3), TinyTopKSAE(), [feature], pulse_state=PulseState())
+
+
+class IdentitySAE:
+    W_dec = torch.eye(3)
+
+    def encode(self, rows: torch.Tensor) -> torch.Tensor:
+        return rows.relu()
+
+
+def test_threshold_and_helpers_delay_without_rearming_on_detector_dropout() -> None:
+    feature = SAEFeatureIntervention(
+        0,
+        "scale",
+        0.25,
+        "norm_relative",
+        cooldown_mode="feature_inactive",
+        activation_threshold=2.0,
+        gate_feature_indices=(1,),
+    )
+    # Below-threshold onset, helper absent, first acceptance, both detector dropouts,
+    # acceptance again within the spent episode, f disappears, and new acceptance.
+    rows = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ]
+    )
+    delta, diag = sae_intervention_delta(
+        rows, IdentitySAE(), [feature], pulse_state=PulseState(), return_diagnostics=True, row_offset=10
+    )
+    assert diag is not None and diag.feature_edit_steps == {0: [12, 17]}
+    assert diag.edit_count == 2
+    assert set(diag.feature_activations) == {0, 1}
+    assert len(diag.residual_norms) == len(rows)
+    # Helpers supply evidence only: the edit has no helper decoder component.
+    assert torch.count_nonzero(delta[:, 1:]) == 0
+    torch.testing.assert_close(delta[2, 0], rows[2].norm() * 0.25)
+
+
+def test_residual_relative_detector_uses_preedit_norm_and_inclusive_threshold() -> None:
+    feature = SAEFeatureIntervention(
+        0,
+        "scale",
+        0.1,
+        "norm_relative",
+        activation_threshold=0.6,
+        threshold_mode="residual_relative",
+    )
+    rows = torch.tensor([[3.0, 4.0, 0.0], [3.0, 5.0, 0.0], [0.0, 0.0, 0.0]])
+    delta, diag = sae_intervention_delta(
+        rows, IdentitySAE(), [feature], pulse_state=PulseState(), return_diagnostics=True
+    )
+    assert diag is not None and diag.feature_edit_steps == {0: [0]}
+    torch.testing.assert_close(delta[0], torch.tensor([0.5, 0.0, 0.0]))
+    assert torch.count_nonzero(delta[1:]) == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"activation_threshold": -1.0},
+        {"activation_threshold": float("nan")},
+        {"gate_feature_indices": (1, 1)},
+        {"gate_feature_indices": (0,)},
+        {"gate_feature_indices": (3,)},
+        {"gate_feature_indices": (True,)},
+    ],
+)
+def test_invalid_detector_configuration_rejected(kwargs: dict) -> None:
+    feature = SAEFeatureIntervention(0, "scale", 0.1, "norm_relative", **kwargs)
+    with pytest.raises(ValueError):
+        sae_intervention_delta(torch.ones(1, 3), IdentitySAE(), [feature], pulse_state=PulseState())

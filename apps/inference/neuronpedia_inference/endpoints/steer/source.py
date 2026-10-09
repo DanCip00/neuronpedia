@@ -64,6 +64,12 @@ def _operation_payload(request: SourceSteerRequest) -> list[SAEFeatureInterventi
             feature_index=int(feature.feature_index),
             operation=feature.operation.value,
             value=None if feature.value is None else float(feature.value),
+            magnitude_mode=feature.magnitude_mode,
+            cooldown_tokens=feature.cooldown_tokens,
+            cooldown_mode=feature.cooldown_mode,
+            activation_threshold=feature.activation_threshold,
+            threshold_mode=feature.threshold_mode,
+            gate_feature_indices=tuple(feature.gate_feature_indices),
         )
         for feature in request.steering.features
     ]
@@ -76,7 +82,11 @@ def _worker_feature_payload(request: SourceSteerRequest) -> list[dict[str, Any]]
         assert feature.value is not None
         return not (
             (feature.operation.value == "add" and float(feature.value) == 0.0)
-            or (feature.operation.value == "scale" and float(feature.value) == 1.0)
+            or (
+                feature.operation.value == "scale"
+                and feature.magnitude_mode == "activation"
+                and float(feature.value) == 1.0
+            )
         )
 
     return [
@@ -84,6 +94,12 @@ def _worker_feature_payload(request: SourceSteerRequest) -> list[dict[str, Any]]
             "feature_index": int(feature.feature_index),
             "operation": feature.operation.value,
             "value": None if feature.value is None else float(feature.value),
+            **({"magnitude_mode": feature.magnitude_mode} if feature.magnitude_mode != "activation" else {}),
+            **({"cooldown_tokens": feature.cooldown_tokens} if feature.cooldown_tokens else {}),
+            **({"cooldown_mode": feature.cooldown_mode} if feature.cooldown_mode != "fixed" else {}),
+            **({"activation_threshold": feature.activation_threshold} if feature.activation_threshold else {}),
+            **({"threshold_mode": feature.threshold_mode} if feature.threshold_mode != "activation" else {}),
+            **({"gate_feature_indices": feature.gate_feature_indices} if feature.gate_feature_indices else {}),
         }
         for feature in (request.steering.features if request.steering else [])
         if is_effective(feature)
@@ -191,25 +207,32 @@ def _format_logprobs(model: VLLMModel, token_ids: list[int], raw: object, limit:
 def _collapse_diagnostics(raw: list[dict[str, Any]]) -> SourceSteerInterventionDiagnostics:
     steps: list[int] = []
     norms: list[float] = []
+    residual_norms: list[float] = []
     activations: dict[str, list[float]] = {}
     encoded = False
     active = False
     edit_count = 0
+    feature_edit_steps: dict[str, list[int]] = {}
     for item in raw:
         offset = int(item.get("row_offset") or 0)
         count = int(item.get("num_rows") or 0)
         steps.extend(range(offset, offset + count))
         item_norms = [float(x) for x in item.get("perturbation_norms") or []]
         norms.extend(item_norms)
+        residual_norms.extend(float(x) for x in item.get("residual_norms") or [])
         edit_count += int(item.get("edit_count") or 0)
         encoded = encoded or bool(item.get("encoded"))
         active = active or bool(item.get("active"))
+        for key, values in (item.get("feature_edit_steps") or {}).items():
+            feature_edit_steps.setdefault(str(key), []).extend(int(v) for v in values)
         for key, values in (item.get("feature_activations") or {}).items():
             activations.setdefault(str(key), []).extend(float(v) for v in values)
     return SourceSteerInterventionDiagnostics(
         edited_prediction_steps=steps,
         edit_count=edit_count,
+        feature_edit_steps=feature_edit_steps,
         perturbation_norms=norms,
+        residual_norms=residual_norms,
         feature_activations=activations,
         encoded=encoded,
         active=active,

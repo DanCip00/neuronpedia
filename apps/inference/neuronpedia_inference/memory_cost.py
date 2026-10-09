@@ -634,3 +634,11 @@ def _selected_sources(request) -> list[str]:  # type: ignore[no-untyped-def]
     if not source_set:
         return []
     return list(SAEManager.get_instance().sae_set_to_saes.get(source_set, []))
+
+
+def source_window_cost(request) -> int:  # type: ignore[no-untyped-def]
+    """Reserve whole-window SAE encoding, captures, and a bounded full-logit batch."""
+    d_sae, d_in = _widest_source_dims([request.steering.source])
+    positions = len(request.token_ids)
+    capture = 2 * positions * d_in * _model_dtype_bytes()
+    return int(FLAT_LENS_BYTES + _OVERHEAD_FACTOR * (_encode_bytes(d_sae, positions) + capture))

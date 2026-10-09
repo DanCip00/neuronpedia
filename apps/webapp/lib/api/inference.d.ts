@@ -302,6 +302,43 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/v1/steer/source': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Steer Source */
+    post: operations['steerSourcePost'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/v1/steer/source/window': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Score Source Window
+     * @description Compare paired causal forwards; never regenerate or alter provided tokens.
+     */
+    post: operations['steerSourceWindowPost'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/v1/tokenize': {
     parameters: {
       query?: never;
@@ -790,6 +827,11 @@ export interface components {
      * @description For a given prompt, get the top activating features for a source (eg 0-gemmascope-res-65k or 5-gemmascope-res-65k), and return the results as a 3D array of prompt x prompt_token x feature_index.
      */
     ActivationSourceRequest: {
+      /**
+       * Activationpositions
+       * @description Optional model-input positions to SAE-encode per batch row. Use -1 for the final model token.
+       */
+      activationPositions?: unknown[][] | null;
       /** Inputs */
       inputs?:
         | (
@@ -828,6 +870,11 @@ export interface components {
      * @description One prompt's results, only including non-zero values and non-zero activations
      */
     ActivationSourceResult: {
+      /**
+       * Activationpositions
+       * @description Normalized model-input positions that were SAE-encoded for this result.
+       */
+      activationPositions?: number[] | null;
       /**
        * Activefeatures
        * @description Dictionary mapping feature indices to arrays of [token_index, activation_value]
@@ -1584,6 +1631,18 @@ export interface components {
       revision?: string | null;
     };
     /**
+     * SAEInterventionOperation
+     * @description How a selected SAE feature changes the hidden state.
+     * @enum {string}
+     */
+    SAEInterventionOperation: 'add' | 'scale' | 'ablate';
+    /**
+     * SAEInterventionPositionPolicy
+     * @description Which generation prediction rows receive the intervention.
+     * @enum {string}
+     */
+    SAEInterventionPositionPolicy: 'next_token' | 'each_generated_token';
+    /**
      * SimilarityMatrixRequest
      * @description Predicted similarity matrix for one feature over a piece of text.
      */
@@ -1606,6 +1665,305 @@ export interface components {
       similarityMatrix: number[][];
       /** Tokens */
       tokens: string[];
+    };
+    /**
+     * SourceSteerFeature
+     * @description One explicitly selected SAE feature intervention.
+     */
+    SourceSteerFeature: {
+      /**
+       * Activationthreshold
+       * @description Minimum pre-edit feature activation; zero preserves the positive-activation gate
+       * @default 0
+       */
+      activationThreshold: number;
+      /**
+       * Cooldownmode
+       * @default fixed
+       * @enum {string}
+       */
+      cooldownMode: 'fixed' | 'feature_inactive';
+      /**
+       * Cooldowntokens
+       * @description Skip N prediction rows after each pulse; zero allows each active row
+       * @default 0
+       */
+      cooldownTokens: number;
+      /**
+       * Featureindex
+       * @description Feature index in the loaded SAE
+       */
+      featureIndex: number;
+      /**
+       * Gatefeatureindices
+       * @description Detector-only SAE helpers, all required to have positive pre-edit activation
+       */
+      gateFeatureIndices?: number[];
+      /**
+       * Magnitudemode
+       * @default activation
+       * @enum {string}
+       */
+      magnitudeMode: 'activation' | 'norm_relative';
+      operation: components['schemas']['SAEInterventionOperation'];
+      /**
+       * Thresholdmode
+       * @description Threshold raw activation or activation divided by the pre-edit residual norm
+       * @default activation
+       * @enum {string}
+       */
+      thresholdMode: 'activation' | 'residual_relative';
+      /** Value */
+      value?: number | null;
+    };
+    /**
+     * SourceSteerInterventionDiagnostics
+     * @description Small diagnostics for rows actually considered by the worker hook.
+     */
+    SourceSteerInterventionDiagnostics: {
+      /**
+       * Active
+       * @default false
+       */
+      active: boolean;
+      /**
+       * Editcount
+       * @default 0
+       */
+      editCount: number;
+      /** Editedpredictionsteps */
+      editedPredictionSteps?: number[];
+      /**
+       * Encoded
+       * @default false
+       */
+      encoded: boolean;
+      /** Featureactivations */
+      featureActivations?: {
+        [key: string]: number[];
+      };
+      /** Featureeditsteps */
+      featureEditSteps?: {
+        [key: string]: number[];
+      };
+      /** Perturbationnorms */
+      perturbationNorms?: number[];
+      /** Residualnorms */
+      residualNorms?: number[];
+    };
+    /**
+     * SourceSteerRequest
+     * @description Non-streaming exact-token generation with optional request-scoped SAE interventions.
+     */
+    SourceSteerRequest: {
+      /**
+       * Failifbusy
+       * @default false
+       */
+      failIfBusy: boolean;
+      insertion?: components['schemas']['ActivationSourceInsertion'] | null;
+      /**
+       * Maxnewtokens
+       * @default 32
+       */
+      maxNewTokens: number;
+      /** Model */
+      model: string;
+      /** Prompttokenids */
+      promptTokenIds: number[][];
+      /**
+       * Returninterventiondiagnostics
+       * @default false
+       */
+      returnInterventionDiagnostics: boolean;
+      steering?: components['schemas']['SourceSteeringSpec'] | null;
+      /**
+       * Temperature
+       * @default 0
+       */
+      temperature: number;
+      /**
+       * Toplogprobs
+       * @default 0
+       */
+      topLogprobs: number;
+    };
+    /**
+     * SourceSteerResolvedMetadata
+     * @description Resolved source and worker-hook schedule served for one request.
+     */
+    SourceSteerResolvedMetadata: {
+      /**
+       * Backend
+       * @default vllm
+       * @constant
+       */
+      backend: 'vllm';
+      /** Features */
+      features?: components['schemas']['SourceSteerFeature'][];
+      /** Hooklayer */
+      hookLayer?: number | null;
+      /** Hookname */
+      hookName?: string | null;
+      /** Hookpoint */
+      hookPoint?: string | null;
+      positionPolicy?: components['schemas']['SAEInterventionPositionPolicy'] | null;
+      /**
+       * Prefillchunking
+       * @default supported
+       * @constant
+       */
+      prefillChunking: 'supported';
+      /** Saelensid */
+      saelensId?: string | null;
+      /** Saelensrelease */
+      saelensRelease?: string | null;
+      /** Source */
+      source?: string | null;
+      /** Sourceset */
+      sourceSet?: string | null;
+    };
+    /**
+     * SourceSteerResponse
+     * @description Result of one source-steered generation request.
+     */
+    SourceSteerResponse: {
+      /** Finishreason */
+      finishReason?: string | null;
+      /** Generatedtext */
+      generatedText: string;
+      /** Generatedtokenids */
+      generatedTokenIds: number[];
+      interventionDiagnostics?: components['schemas']['SourceSteerInterventionDiagnostics'] | null;
+      /** Logprobs */
+      logprobs?: components['schemas']['SourceSteerTokenLogprob'][];
+      /** Modelinputtokenids */
+      modelInputTokenIds: number[];
+      resolved: components['schemas']['SourceSteerResolvedMetadata'];
+    };
+    /**
+     * SourceSteerTokenLogprob
+     * @description The emitted token and the backend-reported top candidates for that generated position.
+     */
+    SourceSteerTokenLogprob: {
+      /** Logprob */
+      logprob?: number | null;
+      /** Token */
+      token: string;
+      /** Tokenid */
+      tokenId: number;
+      /** Toplogprobs */
+      topLogprobs?: components['schemas']['SourceSteerTokenTopLogprob'][];
+    };
+    /**
+     * SourceSteerTokenTopLogprob
+     * @description One top-logprob candidate. These are truncated top-K logprobs, not renormalized.
+     */
+    SourceSteerTokenTopLogprob: {
+      /** Logprob */
+      logprob: number;
+      /** Token */
+      token: string;
+      /** Tokenid */
+      tokenId: number;
+    };
+    /**
+     * SourceSteeringSpec
+     * @description One SAE source whose selected decoder contributions are edited during generation.
+     *
+     *     Operations add or remove decoder-direction contributions in the SAE's native units. SAE
+     *     decoder directions are not generally orthogonal and encoding is nonlinear, so re-encoding an
+     *     edited hidden state need not recover the requested coordinate exactly; ablation removes that
+     *     coordinate's original decoder contribution, not a guarantee that a later encode is zero.
+     */
+    SourceSteeringSpec: {
+      /** Features */
+      features?: components['schemas']['SourceSteerFeature'][];
+      positionPolicy: components['schemas']['SAEInterventionPositionPolicy'];
+      /** Source */
+      source: string;
+      /** Sourceset */
+      sourceSet: string;
+    };
+    /**
+     * SourceWindowScoreArm
+     * @description One distribution comparison, indexed by input prediction position.
+     */
+    SourceWindowScoreArm: {
+      /**
+       * Arm
+       * @enum {string}
+       */
+      arm: 'feature_inactive' | 'single_pulse' | 'baseline_repeat';
+      /** Featureactivations */
+      featureActivations: number[];
+      /** Gatefeatureactivations */
+      gateFeatureActivations?: {
+        [key: string]: number[];
+      };
+      /** Kl */
+      kl: number[];
+      /** Perturbationnorms */
+      perturbationNorms: number[];
+      /** Pulsepositions */
+      pulsePositions: number[];
+      /** Residualnorms */
+      residualNorms: number[];
+      /** Top1Agree */
+      top1Agree: boolean[];
+    };
+    /**
+     * SourceWindowScoreRequest
+     * @description Plain token window; steering follows actual activation throughout it.
+     */
+    SourceWindowScoreRequest: {
+      /**
+       * Failifbusy
+       * @default false
+       */
+      failIfBusy: boolean;
+      /**
+       * Includebaselinerepeat
+       * @default true
+       */
+      includeBaselineRepeat: boolean;
+      /**
+       * Includesinglepulse
+       * @default true
+       */
+      includeSinglePulse: boolean;
+      /** Model */
+      model: string;
+      steering: components['schemas']['SourceSteeringSpec'];
+      /** Tokenids */
+      tokenIds: number[];
+      /** Tracefeatureindices */
+      traceFeatureIndices?: number[];
+    };
+    /**
+     * SourceWindowScoreResponse
+     * @description Position t predicts provided token t+1; the last input row is excluded.
+     */
+    SourceWindowScoreResponse: {
+      /** Arms */
+      arms: components['schemas']['SourceWindowScoreArm'][];
+      /** Baselinefeatureactivations */
+      baselineFeatureActivations: {
+        [key: string]: number[];
+      };
+      /** Baselineresidualnorms */
+      baselineResidualNorms: number[];
+      /**
+       * Klmethod
+       * @default full_vocabulary_forward_float32
+       * @constant
+       */
+      klMethod: 'full_vocabulary_forward_float32';
+      /** Modelinputtokenids */
+      modelInputTokenIds: number[];
+      /** Predictionpositions */
+      predictionPositions: number[];
+      resolved: components['schemas']['SourceSteerResolvedMetadata'];
     };
     /**
      * SteerCompletionChatRequest
@@ -2541,6 +2899,72 @@ export interface operations {
         };
         content: {
           'application/json': unknown;
+        };
+      };
+    };
+  };
+  steerSourcePost: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        'application/json': components['schemas']['SourceSteerRequest'];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['SourceSteerResponse'];
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['HTTPValidationError'];
+        };
+      };
+    };
+  };
+  steerSourceWindowPost: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        'application/json': components['schemas']['SourceWindowScoreRequest'];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['SourceWindowScoreResponse'];
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['HTTPValidationError'];
         };
       };
     };

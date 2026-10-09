@@ -6,7 +6,6 @@ a caller can diff them, which is why ``types`` is a list rather than a flag.
 """
 
 from enum import StrEnum
-from math import isfinite
 from typing import Annotated, Literal
 
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, field_validator, model_validator
@@ -318,6 +317,37 @@ class SourceSteerFeature(BaseSchema):
     feature_index: StrictInt = Field(ge=0, description="Feature index in the loaded SAE")
     operation: SAEInterventionOperation
     value: StrictFloat | None = Field(default=None, allow_inf_nan=False)
+    magnitude_mode: Literal["activation", "norm_relative"] = Field(
+        default="activation", exclude_if=lambda v: v == "activation"
+    )
+    """For scale: value is multiplier m, or rho with delta = rho * ||x|| * unit(decoder)."""
+    cooldown_tokens: StrictInt = Field(
+        default=0,
+        exclude_if=lambda v: v == 0,
+        ge=0,
+        description="Skip N prediction rows after each pulse; zero allows each active row",
+    )
+    cooldown_mode: Literal["fixed", "feature_inactive"] = Field(default="fixed", exclude_if=lambda v: v == "fixed")
+    """feature_inactive rearms only after an unedited SAE activation <= 0; N must be zero."""
+
+    activation_threshold: StrictFloat = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+        exclude_if=lambda v: v == 0.0,
+        description="Minimum pre-edit feature activation; zero preserves the positive-activation gate",
+    )
+    threshold_mode: Literal["activation", "residual_relative"] = Field(
+        default="activation",
+        exclude_if=lambda v: v == "activation",
+        description="Threshold raw activation or activation divided by the pre-edit residual norm",
+    )
+    gate_feature_indices: list[StrictInt] = Field(
+        default_factory=list,
+        max_length=16,
+        exclude_if=lambda v: not v,
+        description="Detector-only SAE helpers, all required to have positive pre-edit activation",
+    )
 
     @field_validator("feature_index")
     @classmethod
@@ -328,14 +358,24 @@ class SourceSteerFeature(BaseSchema):
 
     @model_validator(mode="after")
     def check_operation_value(self) -> "SourceSteerFeature":
-        if self.operation == SAEInterventionOperation.ADD:
-            if self.value is None or not isfinite(float(self.value)):
-                raise ValueError("add requires a finite value")
-        elif self.operation == SAEInterventionOperation.SCALE:
-            if self.value is None or not isfinite(float(self.value)) or float(self.value) < 0:
-                raise ValueError("scale requires a finite nonnegative value")
-        elif self.operation == SAEInterventionOperation.ABLATE and self.value is not None:
-            raise ValueError("ablate does not take a value")
+        from neuronpedia_inference.sae_interventions import SAEFeatureIntervention, validate_feature_interventions
+
+        validate_feature_interventions(
+            [
+                SAEFeatureIntervention(
+                    self.feature_index,
+                    self.operation.value,
+                    self.value,
+                    self.magnitude_mode,
+                    self.cooldown_tokens,
+                    self.cooldown_mode,
+                    self.activation_threshold,
+                    self.threshold_mode,
+                    tuple(self.gate_feature_indices),
+                )
+            ],
+            None,
+        )
         return self
 
 
@@ -403,8 +443,10 @@ class SourceSteerInterventionDiagnostics(BaseSchema):
 
     edited_prediction_steps: list[StrictInt] = Field(default_factory=list)
     edit_count: StrictInt = 0
+    feature_edit_steps: dict[StrictStr, list[StrictInt]] = Field(default_factory=dict)
     perturbation_norms: list[StrictFloat] = Field(default_factory=list)
     feature_activations: dict[StrictStr, list[StrictFloat]] = Field(default_factory=dict)
+    residual_norms: list[StrictFloat] = Field(default_factory=list, exclude_if=lambda v: not v)
     encoded: StrictBool = False
     active: StrictBool = False
 

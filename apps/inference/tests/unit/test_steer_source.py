@@ -325,3 +325,47 @@ def test_duplicate_features_and_batches_are_rejected() -> None:
         )
     with pytest.raises(ValidationError, match="at most 1 item"):
         SourceSteerRequest.model_validate({"model": "toy", "promptTokenIds": [[1], [2]]})
+
+
+def test_relative_pulse_request_echoes_knobs_and_is_not_filtered_at_rho_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, manager = _VLLMModel(), _Manager()
+    _patch_runtime(monkeypatch, model, manager)
+    features = [
+        {"featureIndex": 1, "operation": "scale", "value": 1.0, "magnitudeMode": "norm_relative", "cooldownTokens": 8}
+    ]
+    response = asyncio.run(_call(_request(features, True)))
+    assert response["resolved"]["features"] == features
+    payload = model.engine.calls[0][1][1][0]["features"][0]
+    assert payload["magnitude_mode"] == "norm_relative" and payload["cooldown_tokens"] == 8
+
+
+def test_v7_detector_fields_roundtrip_and_preserve_legacy_payload() -> None:
+    base = {"featureIndex": 0, "operation": "scale", "value": 2.0}
+    legacy = SourceSteerFeature.model_validate(base)
+    assert legacy.model_dump(by_alias=True) == base
+    gated = SourceSteerFeature.model_validate(
+        {**base, "activationThreshold": 0.2, "thresholdMode": "residual_relative", "gateFeatureIndices": [1, 2]}
+    )
+    request = _request([gated.model_dump()])
+    payload = source_endpoint._worker_feature_payload(request)[0]
+    assert payload["activation_threshold"] == 0.2
+    assert payload["threshold_mode"] == "residual_relative"
+    assert payload["gate_feature_indices"] == [1, 2]
+    operation = source_endpoint._operation_payload(request)[0]
+    assert operation.gate_feature_indices == (1, 2)
+    assert operation.activation_threshold == 0.2
+
+
+def test_v7_helper_validation_rejects_add_duplicate_self_and_boolean() -> None:
+    for extra in [
+        {"gateFeatureIndices": [1, 1]},
+        {"gateFeatureIndices": [0]},
+        {"gateFeatureIndices": [True]},
+        {"activationThreshold": -0.1},
+    ]:
+        with pytest.raises(ValidationError):
+            SourceSteerFeature.model_validate({"featureIndex": 0, "operation": "scale", "value": 2.0, **extra})
+    with pytest.raises(ValidationError):
+        SourceSteerFeature.model_validate(
+            {"featureIndex": 0, "operation": "add", "value": 1.0, "gateFeatureIndices": [1]}
+        )

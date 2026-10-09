@@ -106,8 +106,16 @@ from neuronpedia_inference.schemas.util import (
     UtilSaeVectorRequest,
     UtilSaeVectorResponse,
 )
+from neuronpedia_inference.schemas.window import (
+    SourceWindowScoreArm,
+    SourceWindowScoreRequest,
+    SourceWindowScoreResponse,
+)
 
 __all__ = [
+    "SourceWindowScoreArm",
+    "SourceWindowScoreRequest",
+    "SourceWindowScoreResponse",
     "ActivationAllBatchRequest",
     "ActivationAllBatchResponse",
     "ActivationAllBatchResult",

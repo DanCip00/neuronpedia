@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 from interp_engine.vllm_capture._demux import _ensure_dev, _ensure_patched, _get_demux, _maybe_unregister, _release_hook
 from interp_engine.vllm_capture.requests import _ensure_hook, _write_site
 from interp_engine.vllm_plugin import InterpWorkerExtension
 
-from neuronpedia_inference.sae_interventions import SAEFeatureIntervention, sae_intervention_delta
+from neuronpedia_inference.sae_interventions import (
+    InterventionOperation,
+    PulseState,
+    SAEFeatureIntervention,
+    sae_intervention_delta,
+)
 from neuronpedia_inference.saes.saelens import SaeLensSAE
 
 PositionPolicy = Literal["next_token", "each_generated_token"]
@@ -37,8 +42,14 @@ def _features(spec: dict[str, Any]) -> list[SAEFeatureIntervention]:
     return [
         SAEFeatureIntervention(
             feature_index=int(item["feature_index"]),
-            operation=str(item["operation"]),  # type: ignore[arg-type]
+            operation=cast(InterventionOperation, str(item["operation"])),
             value=None if item.get("value") is None else float(item["value"]),
+            magnitude_mode=item.get("magnitude_mode", "activation"),
+            cooldown_tokens=item.get("cooldown_tokens", 0),
+            cooldown_mode=item.get("cooldown_mode", "fixed"),
+            activation_threshold=item.get("activation_threshold", 0.0),
+            threshold_mode=item.get("threshold_mode", "activation"),
+            gate_feature_indices=tuple(item.get("gate_feature_indices", [])),
         )
         for item in spec.get("features", [])
     ]
@@ -75,9 +86,10 @@ def _make_sae_modifier(
     # it lands in. Raising here instead would surface inside the model forward and take the
     # engine down, not just this request.
     next_position = 0
+    pulse_state = PulseState()
 
     def _modify(full: torch.Tensor) -> torch.Tensor:
-        nonlocal next_position
+        nonlocal next_position, pulse_state
         delta = torch.zeros_like(full)
         if full.dim() != 2:
             raise ValueError(f"SAE source steering supports 2-D residual rows only, got {tuple(full.shape)}")
@@ -87,6 +99,9 @@ def _make_sae_modifier(
             # is refused at the API), so several rows at once means vLLM preempted the request
             # and is recomputing its prompt from the start.
             next_position = 0
+            # Replay the same pulses when vLLM rebuilds the KV cache after preemption.
+            pulse_state = PulseState()
+            diag_store.clear()
         start = next_position
         next_position += num_rows
         # Rows to edit, in absolute positions: prompt_len - 1 always (it predicts the first
@@ -103,6 +118,8 @@ def _make_sae_modifier(
             features,
             return_diagnostics=want_diag,
             decoder_vectors_by_feature=decoder_vectors,
+            pulse_state=pulse_state,
+            row_offset=row_offset,
         )
         delta[lo - start : hi - start] = row_delta
         if diagnostics is not None:
@@ -112,7 +129,9 @@ def _make_sae_modifier(
                     "num_rows": diagnostics.edited_rows,
                     "edit_count": diagnostics.edit_count,
                     "perturbation_norms": diagnostics.perturbation_norms,
+                    "residual_norms": diagnostics.residual_norms,
                     "feature_activations": {str(k): v for k, v in diagnostics.feature_activations.items()},
+                    "feature_edit_steps": {str(k): v for k, v in diagnostics.feature_edit_steps.items()},
                     "encoded": diagnostics.encoded,
                     "active": diagnostics.active,
                 }
@@ -173,3 +192,25 @@ class NeuronpediaWorkerExtension(InterpWorkerExtension):
 
     def unregister_sae_feature_steering(self, req_id: str) -> None:
         return worker_unregister_sae_feature_steering(self, req_id)
+
+    def register_code_window(self, req_id: str, spec: dict[str, Any], token_count: int, arm: str) -> None:
+        from neuronpedia_inference.vllm_window_worker import register_window
+
+        register_window(self, req_id, spec, token_count, arm)
+
+    def store_code_window_reference(
+        self, req_id: str, spec: dict[str, Any], token_count: int, trace_indices: list[int]
+    ) -> dict[str, Any]:
+        from neuronpedia_inference.vllm_window_worker import store_window_reference
+
+        return store_window_reference(self, req_id, spec, token_count, trace_indices)
+
+    def compare_code_window(self, req_id: str, reference_id: str, token_count: int, arm: str) -> dict[str, Any]:
+        from neuronpedia_inference.vllm_window_worker import compare_window
+
+        return compare_window(self, req_id, reference_id, token_count, arm)
+
+    def cleanup_code_window(self, req_id: str) -> None:
+        from neuronpedia_inference.vllm_window_worker import cleanup_window
+
+        cleanup_window(self, req_id)
