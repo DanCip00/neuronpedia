@@ -15,6 +15,39 @@ If you are on another machine, either create the same symlink or call the script
 
 Available Qwen-Scope layers are `layer0` through `layer63`.
 
+## Run independent copies
+
+Use a distinct port and explicit GPU for every copy, including copies serving
+the same layer:
+
+```bash
+qwen-scope-layer-server start --layer 52 --port 5002 --cuda-devices 2
+qwen-scope-layer-server start --layer 52 --port 5003 --cuda-devices 3
+```
+
+Both commands return after readiness and leave their own server in the background.
+Each copy has an independent process group, model/SAE state and GPU allocation.
+Logs and pidfiles include both layer and port, so they can share the default log
+directory. The wrapper clears inherited environment settings that would override
+its model, layer, GPU or port arguments. Authentication and disk caches remain
+available. Choose explicit GPUs for simultaneous starts: `auto` cannot account
+for a second process that has not allocated memory yet.
+
+The lib-version-adapter steering and activation clients accept equivalent replicas
+with `--endpoints http://127.0.0.1:5002 http://127.0.0.1:5003`. Keep their model,
+layer, SAE and other inference settings identical. Client workers share this pool;
+one request, including all paired KL arms, stays on one replica.
+
+Stop only the second copy, after confirmation:
+
+```bash
+qwen-scope-layer-server stop --port 5003
+```
+
+The first copy keeps running. Bare `stop` lists the managed copies and asks which
+one to stop; `--yes` still requires an unambiguous target. A different log directory
+can be supplied with `--log-dir` on both start and stop.
+
 ## Start One Layer
 
 ```bash
@@ -92,9 +125,38 @@ same layer after a failure keeps the earlier attempt's output.
 
 ## Stop The Server
 
+Discover running managed servers and ask before stopping one:
+
+```bash
+qwen-scope-layer-server stop
+```
+
+The prompt shows the layer, port, PID and GPU. Answer `y` or `yes` to stop;
+an empty reply, `n`, or end-of-input cancels. If several servers are running,
+choose one first. Discovery reads live pidfiles in `/tmp/neuronpedia-qwen-scope`;
+use `--log-dir PATH` for a custom log directory. Stale pidfiles that identify
+unrelated processes are refused. New pidfiles also record process start identity
+to guard against PID reuse.
+
+Narrow discovery to a specific layer/port, or keep the explicit-pidfile command:
+
+```bash
+qwen-scope-layer-server stop --layer 52 --port 5002
+```
+
 ```bash
 qwen-scope-layer-server stop --pidfile "$PIDFILE"
 ```
+
+Both commands ask for confirmation. For an unattended sweep, explicitly pass
+`--yes` with a unique target:
+
+```bash
+qwen-scope-layer-server stop --pidfile "$PIDFILE" --yes
+```
+
+`--yes` refuses ambiguous discovery rather than stopping every server. Startup
+failure cleanup uses it automatically for the process that start just launched.
 
 `stop` sends `TERM` to the server's process group (read back from `ps` after launch, not assumed),
 waits until every process in the group is gone **and** the port has closed, and escalates to `KILL`
@@ -145,7 +207,7 @@ for layer in 32 36 40 44 48; do
   # Replace this with your client.
   python run_extraction.py --base-url "$BASE_URL" --source "$SOURCE"
 
-  qwen-scope-layer-server stop --pidfile "$PIDFILE"
+  qwen-scope-layer-server stop --pidfile "$PIDFILE" --yes
 done
 ```
 

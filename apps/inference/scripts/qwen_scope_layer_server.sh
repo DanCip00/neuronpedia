@@ -34,10 +34,12 @@ Qwen-Scope Layer Sweep Server
 Start one Neuronpedia inference server for one Qwen-Scope SAE layer, wait until
 the model and SAE are loaded and the SAE answers a probe request, then print a
 JSON line with the PID, process group, URL, pidfile, log file, and stop command.
+Repeat start with distinct ports and explicit GPUs to run independent replicas.
+Each replica has its own process group, model/SAE state, log and pidfile.
 
 Commands:
   ${SCRIPT_NAME} start --layer N [options]
-  ${SCRIPT_NAME} stop --pidfile PATH [--timeout-seconds N]
+  ${SCRIPT_NAME} stop [--pidfile PATH | --layer N] [--port PORT] [--log-dir PATH] [--yes]
   ${SCRIPT_NAME} status --pidfile PATH
   ${SCRIPT_NAME} list-layers
   ${SCRIPT_NAME} pick-gpu [--vllm-gpu-memory-utilization F]
@@ -66,8 +68,15 @@ Other start options:
   --extra-arg ARG                   Extra argument passed to start.py. Repeatable.
 
 Stop options:
-  --pidfile PATH                    Pidfile produced by start.
+  --pidfile PATH                    Target one pidfile; otherwise discover running managed servers.
+  --layer N                         Restrict discovery to one layer.
+  --port PORT                       Restrict discovery to one port.
+  --log-dir PATH                    Discover pidfiles here. Default: ${DEFAULT_LOG_DIR}
+  --yes                            Skip confirmation for explicitly authorized automation.
   --timeout-seconds N               Graceful stop timeout before KILL. Default: ${DEFAULT_STOP_TIMEOUT_SECONDS}
+
+Stop asks for confirmation before sending signals. If discovery finds several
+servers, choose one; --yes requires an unambiguous target. EOF or an empty reply cancels.
 
 Readiness:
   /health answers 500 "Server not initialized" while the model loads and keeps
@@ -102,7 +111,7 @@ Examples:
       SOURCE=\$(jq -r ".source" <<<"\$START_JSON")
 
       python run_extraction.py --base-url "\$BASE_URL" --source "\$SOURCE"
-      ${SCRIPT_NAME} stop --pidfile "\$PIDFILE"
+      ${SCRIPT_NAME} stop --pidfile "\$PIDFILE" --yes
     done
 
 What start launches:
@@ -330,19 +339,92 @@ PY
 load_pidfile() {
   local pidfile="$1"
   [[ -f "$pidfile" ]] || die "pidfile not found: $pidfile"
+  PID=""
+  PGID=""
+  PID_START_TICKS=""
   # shellcheck disable=SC1090
   source "$pidfile"
-  [[ -n "${PID:-}" && -n "${PGID:-}" ]] || die "pidfile is missing PID or PGID: $pidfile"
+  [[ "${PID:-}" =~ ^[0-9]+$ && "${PGID:-}" =~ ^[0-9]+$ && "$PID" -gt 1 && "$PGID" -gt 1 ]] \
+    || die "pidfile has invalid PID or PGID: $pidfile"
+}
+
+process_start_ticks() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+try:
+    print(pathlib.Path(f"/proc/{int(sys.argv[1])}/stat").read_text().rsplit(")", 1)[1].split()[19])
+except (OSError, ValueError, IndexError):
+    sys.exit(1)
+PY
+}
+
+managed_server_alive() {
+  # Pidfiles can survive a crash or refer to a PID later reused by another job.
+  # Verify the recorded process identity before discovery or sending signals.
+  python3 - "$PID" "$PGID" "${LAYER:-}" "${PID_START_TICKS:-}" "$MODEL_ID" <<'PY'
+import os
+import pathlib
+import sys
+
+pid, pgid = map(int, sys.argv[1:3])
+layer, recorded_start, model = sys.argv[3:]
+
+def is_server(candidate):
+    try:
+        if os.getpgid(candidate) != pgid:
+            return False
+        proc = pathlib.Path(f"/proc/{candidate}")
+        fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] == "Z":
+            return False
+        if candidate == pid and recorded_start:
+            return fields[19] == recorded_start
+        args = (proc / "cmdline").read_bytes().split(b"\0")
+        return (any(pathlib.Path(os.fsdecode(arg)).name == "start.py" for arg in args if arg)
+                and os.fsencode(model) in args and os.fsencode(f"^{layer}$") in args)
+    except (OSError, ValueError, IndexError):
+        return False
+
+if is_server(pid):
+    sys.exit(0)
+# The launcher can exit while its server child remains alive in the same group.
+for entry in pathlib.Path("/proc").iterdir():
+    if entry.name.isdigit() and is_server(int(entry.name)):
+        sys.exit(0)
+sys.exit(1)
+PY
 }
 
 process_alive() {
   local pid="$1"
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null && [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" != Z* ]]
 }
 
 group_alive() {
   local pgid="$1"
-  kill -0 "-$pgid" 2>/dev/null
+  kill -0 "-$pgid" 2>/dev/null || return 1
+  # A terminated orphan may remain a zombie until PID 1 reaps it. It holds no
+  # GPU memory or socket and must not block stopping/restarting another replica.
+  python3 - "$pgid" <<'PY'
+import os
+import pathlib
+import sys
+
+pgid = int(sys.argv[1])
+for proc in pathlib.Path('/proc').iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        if os.getpgid(int(proc.name)) == pgid:
+            state = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+            if state != 'Z':
+                sys.exit(0)
+    except (OSError, ValueError, IndexError):
+        continue
+sys.exit(1)
+PY
 }
 
 process_pgid() {
@@ -356,6 +438,7 @@ write_pidfile() {
   cat >"$tmpfile" <<EOF
 PID=$PID
 PGID=$PGID
+PID_START_TICKS=$(process_start_ticks "$PID" || true)
 LAYER=$LAYER
 PORT=$PORT
 HOST=$HOST
@@ -464,6 +547,13 @@ cmd_start() {
 
   (
     cd "$repo/apps/inference"
+    # start.py lets environment variables override CLI flags. Do not inherit
+    # another replica's identity, port, device or model settings from the shell.
+    # Keep credentials and shared download caches; --extra-arg still works.
+    unset SERVER_HOST SERVER_PORT MODEL_DTYPE SAE_DTYPE NUM_GPUS \
+      TOKEN_LIMIT ACTIVATION_BATCH_SIZE INCLUDE_SAE EXCLUDE_SAE FORCE_BACKEND \
+      VLLM_GPU_MEMORY_UTILIZATION JLENS_SKIP DEVICE CUSTOM_HF_MODEL_ID OVERRIDE_MODEL_ID
+    export -n MODEL_ID
     export CUDA_VISIBLE_DEVICES="$cuda_devices"
     export SAE_SETS="[]"
     export SAELENS_RELEASE="[\"${SAELENS_RELEASE}\"]"
@@ -491,7 +581,7 @@ cmd_start() {
   PGID=""
   local attempt
   for attempt in $(seq 1 50); do
-    PGID="$(process_pgid "$PID")"
+    PGID="$(process_pgid "$PID" || true)"
     if [[ -n "$PGID" && "$PGID" != "$(process_pgid $$)" ]]; then
       break
     fi
@@ -525,21 +615,21 @@ cmd_start() {
     case "$state" in
       ready) break ;;
       failed:*)
-        "$0" stop --pidfile "$pidfile" --timeout-seconds 30 >/dev/null || true
+        "$0" stop --pidfile "$pidfile" --timeout-seconds 30 --yes >/dev/null || true
         die "server failed to load ${source}: ${state#failed:}; see log: $log_file"
         ;;
     esac
     sleep 2
   done
   if [[ "$state" != "ready" ]]; then
-    "$0" stop --pidfile "$pidfile" --timeout-seconds 30 >/dev/null || true
+    "$0" stop --pidfile "$pidfile" --timeout-seconds 30 --yes >/dev/null || true
     die "timed out after ${timeout_seconds}s waiting for ${base_url}/health; see log: $log_file"
   fi
 
   if (( probe )); then
     local probe_error
     if ! probe_error="$(source_probe "$base_url" "$source" "$probe_timeout_seconds")"; then
-      "$0" stop --pidfile "$pidfile" --timeout-seconds 30 >/dev/null || true
+      "$0" stop --pidfile "$pidfile" --timeout-seconds 30 --yes >/dev/null || true
       die "server is up but ${source} did not answer /v1/activation/source: ${probe_error}; see log: $log_file"
     fi
   fi
@@ -572,7 +662,7 @@ cmd_status() {
   [[ -n "$pidfile" ]] || die "status requires --pidfile PATH"
   load_pidfile "$pidfile"
 
-  if process_alive "$PID"; then
+  if managed_server_alive; then
     local health
     health="$(health_state "$BASE_URL")"
     printf '{"status":"running","health":"%s","pid":%s,"pgid":%s,"source":"%s","base_url":"%s","cuda_devices":"%s","pidfile":"%s","log":"%s"}\n' \
@@ -587,26 +677,97 @@ cmd_status() {
 
 cmd_stop() {
   local pidfile=""
+  local log_dir="$DEFAULT_LOG_DIR"
+  local layer=""
+  local port_filter=""
+  local assume_yes=0
   local timeout_seconds="$DEFAULT_STOP_TIMEOUT_SECONDS"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pidfile) pidfile="${2:-}"; shift 2 ;;
+      --log-dir) log_dir="${2:-}"; shift 2 ;;
+      --layer) layer="${2:-}"; shift 2 ;;
+      --port) port_filter="${2:-}"; shift 2 ;;
+      --yes|-y) assume_yes=1; shift ;;
       --timeout-seconds) timeout_seconds="${2:-}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown stop option: $1" ;;
     esac
   done
-  [[ -n "$pidfile" ]] || die "stop requires --pidfile PATH"
   validate_positive_int "--timeout-seconds" "$timeout_seconds"
+  [[ -z "$layer" ]] || validate_layer "$layer"
+  [[ -z "$port_filter" ]] || validate_port "$port_filter"
+  if [[ -z "$pidfile" ]]; then
+    local candidates=()
+    local candidate
+    for candidate in "$log_dir"/*.pid; do
+      [[ -f "$candidate" ]] || continue
+      if (
+        load_pidfile "$candidate"
+        [[ -z "$layer" || "${LAYER:-}" == "layer${layer}" ]] || exit 1
+        [[ -z "$port_filter" || "${PORT:-}" == "$port_filter" ]] || exit 1
+        managed_server_alive
+      ); then
+        candidates+=("$candidate")
+      fi
+    done
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+      json_line "not_running" "no matching managed server found in $log_dir"
+      return 0
+    fi
+    if [[ ${#candidates[@]} -gt 1 ]]; then
+      local index=1
+      printf 'Running Qwen-Scope servers:\n' >&2
+      for candidate in "${candidates[@]}"; do
+        (
+          load_pidfile "$candidate"
+          printf '  %s) %s at %s:%s, PID %s, GPU %s\n' "$index" "${LAYER:-unknown}" \
+            "${HOST:-$DEFAULT_HOST}" "${PORT:-$DEFAULT_PORT}" "$PID" "${CUDA_DEVICES:-unknown}" >&2
+        )
+        index=$((index + 1))
+      done
+      (( assume_yes == 0 )) || die "multiple servers found; specify --pidfile or narrow --layer/--port"
+      local selection=""
+      printf 'Choose one server [1-%s, empty cancels]: ' "${#candidates[@]}" >&2
+      IFS= read -r selection || true
+      if [[ -z "$selection" ]]; then
+        json_line "cancelled"
+        return 0
+      fi
+      [[ "$selection" =~ ^[0-9]+$ && "$selection" -ge 1 && "$selection" -le ${#candidates[@]} ]] \
+        || die "invalid server selection"
+      pidfile="${candidates[selection-1]}"
+    else
+      pidfile="${candidates[0]}"
+    fi
+  fi
   load_pidfile "$pidfile"
   local host="${HOST:-$DEFAULT_HOST}"
   local port="${PORT:-$DEFAULT_PORT}"
+  [[ -z "$layer" || "${LAYER:-}" == "layer${layer}" ]] || die "pidfile does not match --layer"
+  [[ -z "$port_filter" || "$port" == "$port_filter" ]] || die "pidfile does not match --port"
 
   if ! process_alive "$PID" && ! group_alive "$PGID"; then
     rm -f "$pidfile"
     json_line "stopped" "process was already gone"
     return 0
   fi
+
+  managed_server_alive || die "pidfile does not identify a running managed server; refusing to signal $PID/$PGID"
+  printf 'Server %s at %s:%s (PID %s, GPU %s)\n' "${LAYER:-unknown}" "$host" "$port" \
+    "$PID" "${CUDA_DEVICES:-unknown}" >&2
+  if (( assume_yes == 0 )); then
+    local answer=""
+    printf 'Stop this server? [y/N] ' >&2
+    IFS= read -r answer || true
+    case "$answer" in
+      y|Y|yes|YES|Yes) ;;
+      *) printf '\n' >&2; json_line "cancelled"; return 0 ;;
+    esac
+  fi
+  printf '\n' >&2
+  # Recheck after confirmation in case the process exited while the prompt waited.
+  managed_server_alive || die "server identity changed while waiting for confirmation; no signal sent"
 
   kill -TERM "-$PGID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true
   if wait_for_release "$PGID" "$PID" "$host" "$port" "$timeout_seconds"; then
