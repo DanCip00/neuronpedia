@@ -50,6 +50,7 @@ def _features(spec: dict[str, Any]) -> list[SAEFeatureIntervention]:
             activation_threshold=item.get("activation_threshold", 0.0),
             threshold_mode=item.get("threshold_mode", "activation"),
             gate_feature_indices=tuple(item.get("gate_feature_indices", [])),
+            gate_feature_thresholds=tuple(item.get("gate_feature_thresholds", [])),
         )
         for item in spec.get("features", [])
     ]

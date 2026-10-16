@@ -344,15 +344,23 @@ def test_v7_detector_fields_roundtrip_and_preserve_legacy_payload() -> None:
     legacy = SourceSteerFeature.model_validate(base)
     assert legacy.model_dump(by_alias=True) == base
     gated = SourceSteerFeature.model_validate(
-        {**base, "activationThreshold": 0.2, "thresholdMode": "residual_relative", "gateFeatureIndices": [1, 2]}
+        {
+            **base,
+            "activationThreshold": 0.2,
+            "thresholdMode": "residual_relative",
+            "gateFeatureIndices": [1, 2],
+            "gateFeatureThresholds": [0.5, 1.5],
+        }
     )
     request = _request([gated.model_dump()])
     payload = source_endpoint._worker_feature_payload(request)[0]
     assert payload["activation_threshold"] == 0.2
     assert payload["threshold_mode"] == "residual_relative"
     assert payload["gate_feature_indices"] == [1, 2]
+    assert payload["gate_feature_thresholds"] == [0.5, 1.5]
     operation = source_endpoint._operation_payload(request)[0]
     assert operation.gate_feature_indices == (1, 2)
+    assert operation.gate_feature_thresholds == (0.5, 1.5)
     assert operation.activation_threshold == 0.2
 
 
@@ -361,6 +369,11 @@ def test_v7_helper_validation_rejects_add_duplicate_self_and_boolean() -> None:
         {"gateFeatureIndices": [1, 1]},
         {"gateFeatureIndices": [0]},
         {"gateFeatureIndices": [True]},
+        {"gateFeatureIndices": [1], "gateFeatureThresholds": [True]},
+        {"gateFeatureIndices": [1], "gateFeatureThresholds": [-1.0]},
+        {"gateFeatureIndices": [1], "gateFeatureThresholds": [float("nan")]},
+        {"gateFeatureIndices": [1], "gateFeatureThresholds": [1.0, 2.0]},
+        {"gateFeatureThresholds": [1.0]},
         {"activationThreshold": -0.1},
     ]:
         with pytest.raises(ValidationError):

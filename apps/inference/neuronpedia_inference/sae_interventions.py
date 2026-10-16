@@ -23,6 +23,7 @@ class SAEFeatureIntervention:
     activation_threshold: float = 0.0
     threshold_mode: Literal["activation", "residual_relative"] = "activation"
     gate_feature_indices: tuple[int, ...] = ()
+    gate_feature_thresholds: tuple[float, ...] = ()
 
     @property
     def pulsed(self) -> bool:
@@ -96,6 +97,11 @@ def validate_feature_interventions(features: list[SAEFeatureIntervention], d_sae
                 raise ValueError("gateFeatureIndices must contain valid nonnegative SAE feature indices")
             if helper == feature.feature_index:
                 raise ValueError("gateFeatureIndices must not include the edited feature")
+        cutoffs = feature.gate_feature_thresholds
+        if cutoffs and len(cutoffs) != len(helpers):
+            raise ValueError("gateFeatureThresholds must align with gateFeatureIndices")
+        if any(type(value) not in (int, float) or not isfinite(value) or value < 0 for value in cutoffs):
+            raise ValueError("gateFeatureThresholds must be finite nonnegative numbers")
         if feature.operation == "add" and (
             feature.activation_threshold > 0 or helpers or feature.threshold_mode != "activation"
         ):
@@ -215,10 +221,11 @@ def sae_intervention_delta(
             detector_mask &= residual_norms > 0
             scores = torch.where(residual_norms > 0, feature_acts / residual_norms.clamp_min(1e-30), 0.0)
         detector_mask &= scores >= feature.activation_threshold
-        for helper_index in feature.gate_feature_indices:
+        cutoffs = feature.gate_feature_thresholds or (0.0,) * len(feature.gate_feature_indices)
+        for helper_index, cutoff in zip(feature.gate_feature_indices, cutoffs, strict=True):
             helper_acts = acts[:, helper_index].to(rows.device, dtype=torch.float32)
             activations_for_diag[helper_index] = [float(x) for x in helper_acts.detach().cpu()]
-            detector_mask &= helper_acts > 0
+            detector_mask &= (helper_acts > 0) & (helper_acts >= cutoff)
         if feature.pulsed:
             assert pulse_state is not None
             edit_masks[:, col] = torch.tensor(

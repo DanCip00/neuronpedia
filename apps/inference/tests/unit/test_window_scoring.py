@@ -141,6 +141,16 @@ def test_schema_rejects_multifeature_and_fixed_cooldown() -> None:
         request(tokenIds=[1] * 513)
 
 
+@pytest.mark.parametrize("count", [1194, 4096])
+def test_expanded_trace_banks_are_accepted(count: int) -> None:
+    assert len(request(traceFeatureIndices=list(range(count))).trace_feature_indices) == count
+
+
+def test_trace_bank_still_has_a_bounded_size() -> None:
+    with pytest.raises(ValidationError, match="at most 4096"):
+        request(traceFeatureIndices=list(range(4097)))
+
+
 class Model:
     tensor_parallel_size = 1
     _engine_kwargs: dict[str, Any] = {}
@@ -279,3 +289,19 @@ def test_window_gate_delays_within_episode_across_chunks_and_single_pulse() -> N
     assert one.pulses == [2]
     assert inactive.gate_activations == {"1": rows[:-1, 1].tolist()}
     assert torch.count_nonzero(whole[:, 1:]) == torch.count_nonzero(split[:, 1:]) == 0
+
+
+@pytest.mark.parametrize("cutoff,pulses", [(0.0, [0, 4]), (2.0, [1, 4])])
+def test_helper_cutoff_matches_across_window_prefill_chunks(cutoff, pulses) -> None:
+    configured = spec()
+    configured["features"][0].update(gate_feature_indices=[1], gate_feature_thresholds=[cutoff])
+    rows = torch.tensor(
+        [[1.0, 0.1, 0.0], [1.0, 2.0, 0.0], [1.0, 3.0, 0.0], [0.0, 2.0, 0.0], [1.0, 2.0, 0.0], [1.0, 2.0, 0.0]]
+    )
+    whole = WindowModifier(configured, TinySAE(), len(rows), "feature_inactive")
+    split = WindowModifier(configured, TinySAE(), len(rows), "feature_inactive")
+    expected = whole(rows)
+    actual = torch.cat([split(rows[:1]), split(rows[1:3]), split(rows[3:])])
+    torch.testing.assert_close(actual, expected)
+    assert whole.pulses == split.pulses == pulses
+    assert torch.count_nonzero(actual[:, 1:]) == 0

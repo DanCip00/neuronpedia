@@ -376,3 +376,26 @@ def test_v7_gate_waits_across_decode_and_replays_without_helper_edits(monkeypatc
     assert sum(d["edit_count"] for d in diagnostics) == 1
     assert all(set(d["feature_activations"]) == {"0", "1"} for d in diagnostics)
     assert sum(len(d["residual_norms"]) for d in diagnostics) == 5
+
+
+def test_worker_gate_cutoff_survives_serialization_and_delays_first_pulse(monkeypatch) -> None:
+    monkeypatch.setattr("neuronpedia_inference.vllm_sae_worker._load_worker_sae", lambda *_: WorkerTinySAE())
+    spec = _spec("each_generated_token", "scale", 0.25)
+    spec["features"][0].update(
+        feature_index=0,
+        magnitude_mode="norm_relative",
+        cooldown_mode="feature_inactive",
+        gate_feature_indices=[1],
+        gate_feature_thresholds=[2.0],
+    )
+    diagnostics = []
+    modifier = _make_sae_modifier(
+        spec,
+        dev=torch.device("cpu"),
+        dt=torch.float32,
+        prompt_len=1,
+        diag_store=diagnostics,
+    )
+    assert torch.count_nonzero(modifier(torch.tensor([[1.0, 0.1, 0.0]]))) == 0
+    assert torch.count_nonzero(modifier(torch.tensor([[1.0, 2.0, 0.0]]))) == 1
+    assert torch.count_nonzero(modifier(torch.tensor([[1.0, 3.0, 0.0]]))) == 0

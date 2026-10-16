@@ -1700,6 +1700,11 @@ export interface components {
        */
       gateFeatureIndices?: number[];
       /**
+       * Gatefeaturethresholds
+       * @description Raw activation cutoffs aligned with gateFeatureIndices; omitted/zero keeps the positive-activation rule
+       */
+      gateFeatureThresholds?: number[];
+      /**
        * Magnitudemode
        * @default activation
        * @enum {string}

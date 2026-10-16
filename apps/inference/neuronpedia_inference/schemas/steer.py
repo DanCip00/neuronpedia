@@ -348,6 +348,12 @@ class SourceSteerFeature(BaseSchema):
         exclude_if=lambda v: not v,
         description="Detector-only SAE helpers, all required to have positive pre-edit activation",
     )
+    gate_feature_thresholds: list[Annotated[StrictFloat, Field(ge=0, allow_inf_nan=False)]] = Field(
+        default_factory=list,
+        max_length=16,
+        exclude_if=lambda v: not v,
+        description="Raw activation cutoffs aligned with gateFeatureIndices; omitted/zero keeps the positive-activation rule",
+    )
 
     @field_validator("feature_index")
     @classmethod
@@ -372,6 +378,7 @@ class SourceSteerFeature(BaseSchema):
                     self.activation_threshold,
                     self.threshold_mode,
                     tuple(self.gate_feature_indices),
+                    tuple(self.gate_feature_thresholds),
                 )
             ],
             None,

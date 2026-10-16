@@ -2575,6 +2575,16 @@
             "title": "Gatefeatureindices",
             "type": "array"
           },
+          "gateFeatureThresholds": {
+            "description": "Raw activation cutoffs aligned with gateFeatureIndices; omitted/zero keeps the positive-activation rule",
+            "items": {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "maxItems": 16,
+            "title": "Gatefeaturethresholds",
+            "type": "array"
+          },
           "magnitudeMode": {
             "default": "activation",
             "enum": [
@@ -3139,7 +3149,7 @@
             "items": {
               "type": "integer"
             },
-            "maxItems": 1024,
+            "maxItems": 4096,
             "title": "Tracefeatureindices",
             "type": "array"
           }

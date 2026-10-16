@@ -34,7 +34,7 @@ Qwen-Scope Layer Sweep Server
 Start one Neuronpedia inference server for one Qwen-Scope SAE layer, wait until
 the model and SAE are loaded and the SAE answers a probe request, then print a
 JSON line with the PID, process group, URL, pidfile, log file, and stop command.
-Repeat start with distinct ports and explicit GPUs to run independent replicas.
+Use --ports and matching --cuda-devices lists to start independent replicas together.
 Each replica has its own process group, model/SAE state, log and pidfile.
 
 Commands:
@@ -48,9 +48,14 @@ Common start options:
   --layer N                         Layer number, 0..${MAX_LAYER}. Example: 31 -> layer31.
   --repo PATH                       Neuronpedia repo. Default: ${DEFAULT_REPO}
   --port PORT                       Bind port. Default: ${DEFAULT_PORT}
+  --ports PORT [PORT ...]            Start one replica per port, paired in order with
+                                    --cuda-devices. Counts must match; no duplicate ports
+                                    or devices. Cannot be combined with --port.
   --cuda-devices IDS|auto           CUDA_VISIBLE_DEVICES, or "auto" to pick the emptiest GPU
                                     with room for the requested vLLM memory fraction.
                                     Default: ${DEFAULT_CUDA_DEVICES}
+                                    With --ports, pass one explicit GPU per port as
+                                    separate arguments, e.g. --cuda-devices 2 3.
   --token-limit N                   Inference token limit. Default: ${DEFAULT_TOKEN_LIMIT}
   --activation-batch-size N         Activation batch size. Default: ${DEFAULT_ACTIVATION_BATCH_SIZE}
   --vllm-gpu-memory-utilization F   vLLM GPU memory fraction. Default: ${DEFAULT_VLLM_GPU_MEMORY_UTILIZATION}
@@ -94,6 +99,9 @@ Authentication:
 Examples:
   Start layer31 on whichever GPU has room:
     START_JSON=\$(${SCRIPT_NAME} start --layer 31 --port 5002)
+
+  Start two independent layer52 copies concurrently (one ready JSON line each):
+    ${SCRIPT_NAME} start --layer 52 --ports 5002 5003 --cuda-devices 2 3
 
   Read fields from the success JSON:
     BASE_URL=\$(jq -r ".base_url" <<<"\$START_JSON")
@@ -483,14 +491,28 @@ cmd_start() {
   local log_dir="$DEFAULT_LOG_DIR"
   local layer=""
   local extra_args=()
+  local ports=()
+  local devices=()
+  local port_given=0
+  local ports_given=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --layer) layer="${2:-}"; shift 2 ;;
       --repo) repo="${2:-}"; shift 2 ;;
       --host) host="${2:-}"; shift 2 ;;
-      --port) port="${2:-}"; shift 2 ;;
-      --cuda-devices) cuda_devices="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; port_given=1; shift 2 ;;
+      --ports)
+        ports_given=1
+        shift
+        [[ $# -gt 0 && "$1" != --* ]] || die "--ports requires at least one port"
+        while [[ $# -gt 0 && "$1" != --* ]]; do ports+=("$1"); shift; done
+        ;;
+      --cuda-devices)
+        shift
+        [[ $# -gt 0 && "$1" != --* ]] || die "--cuda-devices requires a device or auto"
+        while [[ $# -gt 0 && "$1" != --* ]]; do devices+=("$1"); shift; done
+        ;;
       --token-limit) token_limit="${2:-}"; shift 2 ;;
       --activation-batch-size) activation_batch_size="${2:-}"; shift 2 ;;
       --vllm-gpu-memory-utilization) vllm_gpu_memory_utilization="${2:-}"; shift 2 ;;
@@ -515,6 +537,64 @@ cmd_start() {
   validate_positive_int "--probe-timeout-seconds" "$probe_timeout_seconds"
   validate_fraction "--vllm-gpu-memory-utilization" "$vllm_gpu_memory_utilization"
   [[ -d "$repo/apps/inference" ]] || die "repo does not look like Neuronpedia: $repo"
+
+  if (( ports_given )); then
+    (( port_given == 0 )) || die "--port and --ports cannot be combined"
+    (( ${#ports[@]} == ${#devices[@]} )) \
+      || die "--ports and --cuda-devices must have the same number of entries"
+    local -A seen_ports=() seen_devices=()
+    local i device replica_port
+    # Validate the entire pool before starting any copy.
+    for i in "${!ports[@]}"; do
+      validate_port "${ports[i]}"
+      replica_port="$((10#${ports[i]}))"
+      [[ -z "${seen_ports[$replica_port]+yes}" ]] || die "duplicate port: $replica_port"
+      seen_ports[$replica_port]=1
+      ports[i]="$replica_port"
+      device="${devices[i]}"
+      [[ "$device" =~ ^[0-9]+$ || "$device" =~ ^GPU-[[:alnum:]-]+$ || "$device" =~ ^MIG-[[:alnum:]/-]+$ ]] \
+        || die "--ports requires one explicit GPU index or UUID per entry; got '$device'"
+      if [[ "$device" =~ ^[0-9]+$ ]]; then device="$((10#$device))"; fi
+      [[ -z "${seen_devices[$device]+yes}" ]] || die "duplicate CUDA device: $device"
+      seen_devices[$device]=1
+      devices[i]="$device"
+      if port_is_open "$host" "$replica_port"; then
+        die "port ${host}:${replica_port} is already accepting connections; no replicas started"
+      fi
+      local existing_pidfile="${log_dir}/layer${layer}.port${replica_port}.pid"
+      if [[ -f "$existing_pidfile" ]] && (
+        load_pidfile "$existing_pidfile"
+        process_alive "$PID"
+      ); then
+        die "pidfile already exists for a live process: $existing_pidfile; no replicas started"
+      fi
+    done
+    local shared_args=(
+      --layer "$layer" --repo "$repo" --host "$host" --log-dir "$log_dir"
+      --token-limit "$token_limit" --activation-batch-size "$activation_batch_size"
+      --vllm-gpu-memory-utilization "$vllm_gpu_memory_utilization"
+      --max-concurrent-requests "$max_concurrent_requests"
+      --timeout-seconds "$timeout_seconds" --probe-timeout-seconds "$probe_timeout_seconds"
+    )
+    if (( probe == 0 )); then shared_args+=(--no-probe); fi
+    for device in "${extra_args[@]}"; do shared_args+=(--extra-arg "$device"); done
+    local launchers=() status=0
+    for i in "${!ports[@]}"; do
+      "$SCRIPT_PATH" start "${shared_args[@]}" --port "${ports[i]}" --cuda-devices "${devices[i]}" &
+      launchers+=("$!")
+    done
+    # Wait for every readiness check even when one copy fails. Successful copies
+    # remain independent and can be stopped individually with their own pidfiles.
+    for i in "${!launchers[@]}"; do
+      if ! wait "${launchers[i]}"; then
+        echo "error: replica on port ${ports[i]} / GPU ${devices[i]} failed; successful copies remain running" >&2
+        status=1
+      fi
+    done
+    return "$status"
+  fi
+  (( ${#devices[@]} <= 1 )) || die "multiple devices require --ports with a matching port list"
+  cuda_devices="${devices[0]:-$DEFAULT_CUDA_DEVICES}"
 
   if port_is_open "$host" "$port"; then
     die "port ${host}:${port} is already accepting connections; stop that server or pass --port"

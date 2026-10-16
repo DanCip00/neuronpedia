@@ -70,6 +70,7 @@ def _operation_payload(request: SourceSteerRequest) -> list[SAEFeatureInterventi
             activation_threshold=feature.activation_threshold,
             threshold_mode=feature.threshold_mode,
             gate_feature_indices=tuple(feature.gate_feature_indices),
+            gate_feature_thresholds=tuple(feature.gate_feature_thresholds),
         )
         for feature in request.steering.features
     ]
@@ -100,6 +101,7 @@ def _worker_feature_payload(request: SourceSteerRequest) -> list[dict[str, Any]]
             **({"activation_threshold": feature.activation_threshold} if feature.activation_threshold else {}),
             **({"threshold_mode": feature.threshold_mode} if feature.threshold_mode != "activation" else {}),
             **({"gate_feature_indices": feature.gate_feature_indices} if feature.gate_feature_indices else {}),
+            **({"gate_feature_thresholds": feature.gate_feature_thresholds} if feature.gate_feature_thresholds else {}),
         }
         for feature in (request.steering.features if request.steering else [])
         if is_effective(feature)

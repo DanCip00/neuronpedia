@@ -189,13 +189,14 @@ class TestQwenScopeLayerServer(TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "not_running")
 
-    def test_independent_replicas_start_and_stop_through_the_launcher(self) -> None:
-        """CLI settings win over inherited settings; stopping one leaves the other alive."""
+    def fake_start_environment(self) -> tuple[Path, dict[str, str]]:
+        """Use tiny HTTP servers instead of GPU/model processes."""
         app = self.root / "repo/apps/inference"
         app.mkdir(parents=True)
         app.joinpath("start.py").write_text("""import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -203,6 +204,8 @@ def setting(flag, env):
     return os.environ.get(env, sys.argv[sys.argv.index(flag) + 1])
 
 port = int(setting('--port', 'SERVER_PORT'))
+if str(port) == os.environ.get('FAKE_FAIL_PORT'):
+    sys.exit(1)
 identity = {
     'port': port,
     'cuda': os.environ['CUDA_VISIBLE_DEVICES'],
@@ -210,6 +213,12 @@ identity = {
     'source': setting('--include_sae', 'INCLUDE_SAE'),
 }
 Path(f'identity-{port}.json').write_text(json.dumps(identity))
+expected = os.environ.get('FAKE_EXPECT_PORTS', '')
+deadline = time.monotonic() + 4
+while expected and not all(Path(f'identity-{p}.json').exists() for p in expected.split(',')):
+    if time.monotonic() > deadline:
+        raise RuntimeError('the other replica was not started concurrently')
+    time.sleep(0.02)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -239,6 +248,43 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
             "MODEL_ID": "wrong",
             "INCLUDE_SAE": "wrong",
         }
+        return app, env
+
+    def start_pool(self, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+        """Record every pidfile for cleanup, including after a failed start."""
+        try:
+            return subprocess.run(
+                [
+                    "bash",
+                    str(self.script),
+                    "start",
+                    "--repo",
+                    str(self.root / "repo"),
+                    "--layer",
+                    "52",
+                    "--timeout-seconds",
+                    "10",
+                    *args,
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        finally:
+            self.managed_pidfiles.extend(self.log_dir.glob("*.pid"))
+
+    def free_ports(self) -> tuple[str, str]:
+        """Reserve two different ephemeral ports, then release them together."""
+        with socket.socket() as first, socket.socket() as second:
+            first.bind(("127.0.0.1", 0))
+            second.bind(("127.0.0.1", 0))
+            return str(first.getsockname()[1]), str(second.getsockname()[1])
+
+    def test_independent_replicas_start_and_stop_through_the_launcher(self) -> None:
+        """CLI settings win over inherited settings; stopping one leaves the other alive."""
+        app, env = self.fake_start_environment()
         replicas: list[dict[str, object]] = []
         for gpu in (2, 3):
             with socket.socket() as probe:
@@ -288,3 +334,102 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         )
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(json.loads(status.stdout)["status"], "running")
+
+    def test_pool_pairs_devices_and_ports_and_starts_concurrently(self) -> None:
+        app, env = self.fake_start_environment()
+        first, second = self.free_ports()
+        env["FAKE_EXPECT_PORTS"] = f"{first},{second}"
+        result = self.start_pool(
+            env,
+            "--ports",
+            first,
+            second,
+            "--cuda-devices",
+            "2",
+            "3",
+            "--max-concurrent-requests",
+            "48",
+            "--extra-arg",
+            "--fake-option",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replicas = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(replicas), 2)
+        self.assertEqual(
+            {info["base_url"] for info in replicas},
+            {
+                f"http://127.0.0.1:{first}",
+                f"http://127.0.0.1:{second}",
+            },
+        )
+        self.assertEqual(len({info["pgid"] for info in replicas}), 2)
+        self.assertEqual(len({info["pidfile"] for info in replicas}), 2)
+        self.assertEqual(len({info["log"] for info in replicas}), 2)
+        for port, gpu in ((first, "2"), (second, "3")):
+            identity = json.loads((app / f"identity-{port}.json").read_text())
+            self.assertEqual(identity["cuda"], gpu)
+            self.assertEqual(identity["source"], "^layer52$")
+        for info in replicas:
+            self.assertTrue(info["probed"])
+            self.assertEqual(info["max_concurrent_requests"], 48)
+        stopped = self.call("--port", first, "--yes")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        status = subprocess.run(
+            ["bash", str(self.script), "status", "--pidfile", str(self.log_dir / f"layer52.port{second}.pid")],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(json.loads(status.stdout)["status"], "running")
+
+    def test_invalid_pools_do_not_start_any_server(self) -> None:
+        app, env = self.fake_start_environment()
+        cases = [
+            (["--ports", "5002", "5003", "--cuda-devices", "2"], "same number"),
+            (["--ports", "5002", "5003"], "same number"),
+            (["--ports", "5002", "5002", "--cuda-devices", "2", "3"], "duplicate port"),
+            (["--ports", "5002", "5003", "--cuda-devices", "2", "2"], "duplicate CUDA device"),
+            (["--ports", "5002", "--cuda-devices", "auto"], "explicit GPU"),
+            (["--port", "5002", "--ports", "5003", "--cuda-devices", "2"], "cannot be combined"),
+            (["--ports", "5002", "65536", "--cuda-devices", "2", "3"], "1..65535"),
+            (["--cuda-devices", "2", "3"], "multiple devices require --ports"),
+            (["--ports"], "requires at least one port"),
+        ]
+        for args, error in cases:
+            with self.subTest(args=args):
+                result = self.start_pool(env, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertFalse(list(app.glob("identity-*.json")))
+                self.assertFalse(list(self.log_dir.iterdir()))
+
+    def test_occupied_port_is_checked_before_starting_other_replicas(self) -> None:
+        app, env = self.fake_start_environment()
+        first, _ = self.free_ports()
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            result = self.start_pool(
+                env,
+                "--ports",
+                first,
+                str(occupied.getsockname()[1]),
+                "--cuda-devices",
+                "2",
+                "3",
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no replicas started", result.stderr)
+        self.assertFalse(list(app.glob("identity-*.json")))
+
+    def test_failed_replica_returns_failure_and_leaves_successful_copy_independent(self) -> None:
+        app, env = self.fake_start_environment()
+        first, second = self.free_ports()
+        env["FAKE_FAIL_PORT"] = first
+        result = self.start_pool(env, "--ports", first, second, "--cuda-devices", "2", "3")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"replica on port {first}", result.stderr)
+        replicas = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(replicas), 1)
+        self.assertEqual(replicas[0]["base_url"], f"http://127.0.0.1:{second}")
+        self.assertTrue((app / f"identity-{second}.json").exists())

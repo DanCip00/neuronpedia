@@ -7,6 +7,8 @@ from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model
 from neuronpedia_inference.schemas.common import ExactSchema
 from neuronpedia_inference.schemas.steer import SourceSteeringSpec, SourceSteerResolvedMetadata
 
+MAX_WINDOW_TRACE_FEATURES = 4096
+
 
 class SourceWindowScoreRequest(ExactSchema):
     """Plain token window; steering follows actual activation throughout it."""
@@ -16,7 +18,9 @@ class SourceWindowScoreRequest(ExactSchema):
     steering: SourceSteeringSpec
     include_single_pulse: StrictBool = True
     include_baseline_repeat: StrictBool = True
-    trace_feature_indices: list[StrictInt] = Field(default_factory=list, max_length=1024)
+    # Expanded candidate/helper banks exceed 1,024. Keep the response bounded:
+    # at 512 tokens this permits at most about two million baseline trace values.
+    trace_feature_indices: list[StrictInt] = Field(default_factory=list, max_length=MAX_WINDOW_TRACE_FEATURES)
     fail_if_busy: StrictBool = False
 
     @model_validator(mode="after")

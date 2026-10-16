@@ -260,3 +260,42 @@ def test_invalid_detector_configuration_rejected(kwargs: dict) -> None:
     feature = SAEFeatureIntervention(0, "scale", 0.1, "norm_relative", **kwargs)
     with pytest.raises(ValueError):
         sae_intervention_delta(torch.ones(1, 3), IdentitySAE(), [feature], pulse_state=PulseState())
+
+
+@pytest.mark.parametrize("cutoff, expected", [(0.0, [0, 5]), (2.0, [1, 5])])
+def test_helper_cutoff_is_inclusive_and_zero_keeps_positive_gate(cutoff, expected) -> None:
+    feature = SAEFeatureIntervention(
+        0,
+        "scale",
+        0.25,
+        "norm_relative",
+        cooldown_mode="feature_inactive",
+        gate_feature_indices=(1,),
+        gate_feature_thresholds=(cutoff,),
+    )
+    rows = torch.tensor(
+        [[1.0, 0.1, 0.0], [1.0, 2.0, 0.0], [1.0, 0.0, 0.0], [1.0, 3.0, 0.0], [0.0, 2.0, 0.0], [1.0, 2.0, 0.0]]
+    )
+    delta, diag = sae_intervention_delta(
+        rows,
+        IdentitySAE(),
+        [feature],
+        pulse_state=PulseState(),
+        return_diagnostics=True,
+    )
+    assert diag is not None and diag.feature_edit_steps == {0: expected}
+    assert torch.count_nonzero(delta[:, 1:]) == 0
+
+
+@pytest.mark.parametrize("cutoffs", [(-1.0,), (float("nan"),), (True,), (1.0, 2.0)])
+def test_helper_cutoff_validation(cutoffs) -> None:
+    feature = SAEFeatureIntervention(
+        0,
+        "scale",
+        0.25,
+        "norm_relative",
+        gate_feature_indices=(1,),
+        gate_feature_thresholds=cutoffs,
+    )
+    with pytest.raises(ValueError, match="gateFeatureThresholds"):
+        sae_intervention_delta(torch.ones(1, 3), IdentitySAE(), [feature], pulse_state=PulseState())

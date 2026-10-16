@@ -17,15 +17,24 @@ Available Qwen-Scope layers are `layer0` through `layer63`.
 
 ## Run independent copies
 
-Use a distinct port and explicit GPU for every copy, including copies serving
-the same layer:
+Pass matching lists to start several copies concurrently, including copies serving
+the same layer. Pairing follows argument order:
 
 ```bash
-qwen-scope-layer-server start --layer 52 --port 5002 --cuda-devices 2
-qwen-scope-layer-server start --layer 52 --port 5003 --cuda-devices 3
+qwen-scope-layer-server start --layer 52 \
+  --ports 5002 5003 --cuda-devices 2 3 \
+  --max-concurrent-requests 64
 ```
 
-Both commands return after readiness and leave their own server in the background.
+The command waits for every readiness check and emits one ready JSON line per
+copy (completion order can differ from pairing order). It leaves each server in
+the background. The two lists must have equal length, with distinct ports and
+distinct explicit GPU indices/UUIDs; `auto` is not accepted for a pool.
+All ports are checked before any copy starts. If startup later fails for one
+copy, the command exits nonzero and successful copies remain running.
+
+The single-copy form remains available: `start --layer 52 --port 5002 --cuda-devices 2`.
+Do not combine `--port` and `--ports`.
 Each copy has an independent process group, model/SAE state and GPU allocation.
 Logs and pidfiles include both layer and port, so they can share the default log
 directory. The wrapper clears inherited environment settings that would override
